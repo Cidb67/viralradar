@@ -219,18 +219,20 @@ def checar_novos_posts_perfil(email, perfil):
     conn.close()
 
     try:
-        novo_id_encontrado = f"post_{perfil}_atualizado" 
+        # Varredura simulada / estruturada de requisição real do Instagram
+        novo_id_encontrado = f"post_{perfil}_id_atual" 
         post_url = f"https://instagram.com/{perfil}/"
 
-        if ultimo_salvo == "nenhum" or ultimo_salvo is None:
+        if ultimo_salvo == "nenhum" or ultimo_salvo is None or ultimo_salvo == "":
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
             conn.commit()
             conn.close()
-            registrar_historico_db(f"Perfil @{perfil} inicializado no monitoramento.")
-            return False, "Inicializado"
+            registrar_historico_db(f"Perfil @{perfil} sincronizado no monitoramento.")
+            return False, "Sincronizado"
 
+        # Se detectarmos um ID diferente do último salvo, dispara o alerta
         elif novo_id_encontrado != ultimo_salvo:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
@@ -245,7 +247,7 @@ def checar_novos_posts_perfil(email, perfil):
                 f"🔗 [Acessar Publicação]({post_url})"
             )
             
-            registrar_historico_db(f"Alerta disparado para @{perfil}")
+            registrar_historico_db(f"Alerta enviado para @{perfil}")
             
             token, chat_id = ler_config_telegram_db(email)
             if token and chat_id:
@@ -257,7 +259,7 @@ def checar_novos_posts_perfil(email, perfil):
         registrar_historico_db(f"Erro na varredura de @{perfil}: {e}")
         return False, str(e)
 
-    registrar_historico_db(f"Varredura concluída para @{perfil} (Sem novos posts).")
+    registrar_historico_db(f"Varredura concluída para @{perfil} (Nenhuma nova postagem).")
     return False, "Sem novos posts"
 
 # ==========================================
@@ -377,12 +379,14 @@ if opcao == "Painel Principal":
             if perfil_input:
                 perfil_limpo = perfil_input.replace("@", "").strip().lower()
                 
+                # Se atingiu o limite máximo de 10 perfis, verificar se tem trocas para substituir
                 if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
                     if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
                         st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} perfis atingido e suas trocas mensais esgotaram!")
                     else:
-                        st.warning("⚠️ Limite de perfis atingido. Exclua um perfil existente ou utilize suas trocas.")
+                        st.warning("⚠️ Limite de perfis atingido. Exclua um perfil existente para liberar vaga.")
                 else:
+                    # Cadastro normal dentro da franquia do plano (NÃO gasta trocas)
                     sucesso, status = salvar_perfil_db(email_usuario, perfil_limpo)
                     if sucesso:
                         st.success(f"Perfil '@{perfil_limpo}' cadastrado com sucesso!")
@@ -408,7 +412,8 @@ if opcao == "Painel Principal":
             with bcol3:
                 if st.button(f"🗑️ Excluir", key=f"excluir_{p}"):
                     if excluir_perfil_db(email_usuario, p):
-                        if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
+                        # Só consome troca se o usuário já estava com a lista totalmente cheia (10/10)
+                        if qtd_atual >= LIMITE_PLANO_INICIAL:
                             registrar_substituicao_db(email_usuario)
                         st.success(f"Perfil @{p} removido!")
                         st.rerun()
@@ -417,7 +422,7 @@ if opcao == "Painel Principal":
         if st.button("🔄 Executar Varredura e Checar Novos Posts", key="btn_checar_posts"):
             for p in perfis_cadastrados:
                 checar_novos_posts_perfil(email_usuario, p)
-            st.success("Varredura concluída com sucesso nos perfis monitorados!")
+            st.success("Varredura concluída com sucesso nos perfis monitorados! Verifique o Histórico de Alertas.")
             st.rerun()
     else:
         st.info("Nenhum perfil cadastrado ainda. Adicione acima para começar.")
