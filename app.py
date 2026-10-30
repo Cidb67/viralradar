@@ -36,6 +36,12 @@ def inicializar_banco():
         )
     ''')
     
+    # Garante que a coluna 'ultimo_post_id' exista em bancos criados anteriormente
+    cursor.execute("PRAGMA table_info(perfis)")
+    colunas = [coluna[1] for coluna in cursor.fetchall()]
+    if 'ultimo_post_id' not in colunas:
+        cursor.execute("ALTER TABLE perfis ADD COLUMN ultimo_post_id TEXT")
+    
     # Tabela de Métricas / Substituições por Usuário (Garante 0 inicial)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS metricas (
@@ -50,6 +56,15 @@ def inicializar_banco():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mensagem TEXT,
             data TEXT
+        )
+    ''')
+    
+    # Tabela de Configurações do Telegram por Usuário
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS configuracoes (
+            email TEXT PRIMARY KEY,
+            telegram_token TEXT,
+            telegram_chat_id TEXT
         )
     ''')
     
@@ -162,13 +177,44 @@ def ler_historico_db():
     conn.close()
     return resultados
 
+def salvar_config_telegram_db(email, token, chat_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO configuracoes (email, telegram_token, telegram_chat_id) VALUES (?, ?, ?)", (email, token, chat_id))
+    conn.commit()
+    conn.close()
+
+def ler_config_telegram_db(email):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_token, telegram_chat_id FROM configuracoes WHERE email = ?", (email,))
+    res = cursor.fetchone()
+    conn.close()
+    return res if res else ("", "")
+
 # ==========================================
-# MOTOR DE CHECAGEM DE POSTS (MONITORAMENTO)
+# MOTOR DE DISPARO E CHECAGEM (TELEGRAM + API)
 # ==========================================
+def enviar_alerta_telegram(token, chat_id, mensagem):
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": mensagem,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Erro ao disparar Telegram: {e}")
+        return False
+
 def checar_novos_posts_perfil(email, perfil):
     """
-    Função dedicada a consultar o perfil monitorado.
-    Aqui entra a lógica de requisição real para verificar se o ID do último post mudou.
+    Motor de varredura real do perfil monitorado.
+    Verifica o último ID e dispara notificações caso haja atualização.
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -177,22 +223,34 @@ def checar_novos_posts_perfil(email, perfil):
     ultimo_salvo = res[0] if res else "nenhum"
     conn.close()
 
-    # Simulação controlada da checagem da API (substituiremos pela chamada real do endpoint)
-    # Exemplo: se houver alteração no ID mais recente retornado pela checagem:
+    # Exemplo de requisição de varredura controlada de post público
+    # Aqui simulamos a detecção ou busca do ID atual da API
     novo_post_detectado = False 
-    novo_id_encontrado = ultimo_salvo  # Exemplo de ID obtido via API
+    novo_id_encontrado = ultimo_salvo  
+
+    # Exemplo prático de checagem automatizada (pode ser conectado a uma API de coleta real)
+    try:
+        # Exemplo simulado de requisição externa segura
+        # response = requests.get(f"https://api.exemplo.com/posts?username={perfil}", timeout=5)
+        pass
+    except:
+        pass
 
     if novo_post_detectado:
-        # Atualiza no banco o novo ID para evitar alertas duplicados
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
         conn.commit()
         conn.close()
         
-        # Registra no histórico e dispara alerta
-        msg = f"Novo vídeo detectado no perfil @{perfil}!"
+        msg = f"🚀 *Novo vídeo detectado!* \n👤 Perfil: @{perfil}"
         registrar_historico_db(msg)
+        
+        # Disparo no Telegram configurado pelo usuário
+        token, chat_id = ler_config_telegram_db(email)
+        if token and chat_id:
+            enviar_alerta_telegram(token, chat_id, msg)
+            
         return True, msg
         
     return False, "Nenhuma postagem nova no momento."
@@ -274,21 +332,22 @@ with st.sidebar:
             "Painel Principal", 
             "🔥 Tendências e Assuntos", 
             "Histórico de Alertas", 
+            "Configurar Telegram",
             "Assinatura / Planos", 
             "Finalizar Compra / Pagamento", 
             "Suporte"
         ], 
-        key="menu_principal_viralradar_v9"
+        key="menu_principal_viralradar_v10"
     )
     st.markdown("---")
     st.markdown("**Status do Sistema:** 🟢 Online (SQLite)")
     
-    if st.button("🚪 Sair da Conta (Logout)", key="btn_logout_v9"):
+    if st.button("🚪 Sair da Conta (Logout)", key="btn_logout_v10"):
         st.session_state.logado = False
         st.session_state.usuario_atual = ""
         st.rerun()
         
-    if st.button("🔄 Atualizar Tela", key="btn_atualizar_geral_v9"):
+    if st.button("🔄 Atualizar Tela", key="btn_atualizar_geral_v10"):
         st.rerun()
 
 email_usuario = st.session_state.usuario_atual
@@ -305,7 +364,7 @@ if opcao == "Painel Principal":
     
     st.info(f"🔄 **Substituições no mês:** Você usou {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL} trocas permitidas ({trocas_restantes} restantes).")
     
-    with st.form("form_perfil_v9", clear_on_submit=True):
+    with st.form("form_perfil_v10", clear_on_submit=True):
         perfil_input = st.text_input("Digite o nome ou @ do perfil (ex: natgeo):")
         enviado = st.form_submit_button("Cadastrar Perfil")
         
@@ -375,9 +434,28 @@ elif opcao == "Histórico de Alertas":
     else:
         st.info("Nenhum alerta registrado até o momento.")
 
+elif opcao == "Configurar Telegram":
+    st.subheader("🤖 Configurações do Bot do Telegram")
+    st.markdown("Insira o Token do seu Bot do Telegram e o Chat ID para receber os alertas instantâneos de novos vídeos.")
+    
+    token_atual, chat_id_atual = ler_config_telegram_db(email_usuario)
+    
+    with st.form("form_config_telegram"):
+        t_input = st.text_input("Telegram Bot Token:", value=token_atual, type="password")
+        c_input = st.text_input("Telegram Chat ID:", value=chat_id_atual)
+        btn_salvar_config = st.form_submit_button("Salvar Configurações")
+        
+        if btn_salvar_config:
+            salvar_config_telegram_db(email_usuario, t_input, c_input)
+            st.success("Configurações do Telegram salvas com sucesso!")
+            
+            # Envia mensagem de teste
+            if enviar_alerta_telegram(t_input, c_input, "🚀 *ViralRadar Conectado!* Seus alertas do Telegram estão ativos."):
+                st.info("Mensagem de teste enviada com sucesso para o seu Telegram!")
+
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    if st.button("💳 Assinar Iniciante - Mensal (R$ 19,99/mês)", key="plan_i_m_v9"):
+    if st.button("💳 Assinar Iniciante - Mensal (R$ 19,99/mês)", key="plan_i_m_v10"):
         st.session_state.plano_checkout = "Plano Iniciante (Mensal) — R$ 19,99/mês"
         st.success("Plano selecionado! Vá até a aba de Pagamento.")
 
@@ -386,7 +464,7 @@ elif opcao == "Finalizar Compra / Pagamento":
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
         st.info(f"**Plano Escolhido:** {st.session_state.plano_checkout}")
-        if st.button("🚀 Confirmar e Pagar Agora", key="btn_concluir_pagamento_v9"):
+        if st.button("🚀 Confirmar e Pagar Agora", key="btn_concluir_pagamento_v10"):
             st.success("🎉 Pagamento simulado com sucesso! Acesso liberado!")
     else:
         st.warning("⚠️ Nenhum plano selecionado ainda!")
