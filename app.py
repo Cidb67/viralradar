@@ -3,6 +3,7 @@ import os
 import sqlite3
 import hashlib
 import random
+import requests
 from datetime import datetime
 
 # Nome do Banco de Dados SQLite
@@ -30,11 +31,12 @@ def inicializar_banco():
         CREATE TABLE IF NOT EXISTS perfis (
             email TEXT,
             perfil TEXT,
+            ultimo_post_id TEXT,
             PRIMARY KEY (email, perfil)
         )
     ''')
     
-    # Tabela de Métricas / Substituições por Usuário
+    # Tabela de Métricas / Substituições por Usuário (Garante 0 inicial)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS metricas (
             email TEXT PRIMARY KEY,
@@ -53,25 +55,11 @@ def inicializar_banco():
     
     conn.commit()
     conn.close()
-    
-    # Inserir histórico de exemplo se estiver vazio
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM historico")
-    if cursor.fetchone()[0] == 0:
-        exemplos = [
-            ("Novo vídeo detectado em @virginiafonseca (739 posts)", "2026-10-30 12:10"),
-            ("Novo vídeo detectado em @vinnijr (1462 posts)", "2026-10-30 11:25"),
-            ("Novo vídeo detectado em @neymarjr (497 posts)", "2026-10-30 09:40")
-        ]
-        cursor.executemany("INSERT INTO historico (mensagem, data) VALUES (?, ?)", exemplos)
-        conn.commit()
-    conn.close()
 
 # Inicializa o banco ao iniciar o app
 inicializar_banco()
 
-# Função para gerar Hash SHA-256 da senha (segurança profissional)
+# Função para gerar Hash SHA-256 da senha
 def criar_hash_senha(senha):
     return hashlib.sha256(senha.encode('utf-8')).hexdigest()
 
@@ -84,7 +72,7 @@ def cadastrar_usuario_db(email, senha):
     try:
         senha_hash = criar_hash_senha(senha)
         cursor.execute("INSERT INTO usuarios (email, senha) VALUES (?, ?)", (email, senha_hash))
-        cursor.execute("INSERT INTO metricas (email, trocas) VALUES (?, 0)", (email,))
+        cursor.execute("INSERT OR REPLACE INTO metricas (email, trocas) VALUES (?, 0)", (email,))
         conn.commit()
         conn.close()
         return True, "Cadastro realizado com sucesso!"
@@ -117,7 +105,7 @@ def salvar_perfil_db(email, novo_perfil):
     if novo_perfil not in perfis:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO perfis (email, perfil) VALUES (?, ?)", (email, novo_perfil))
+        cursor.execute("INSERT INTO perfis (email, perfil, ultimo_post_id) VALUES (?, ?, ?)", (email, novo_perfil, "nenhum"))
         conn.commit()
         conn.close()
         return True, "Sucesso"
@@ -136,8 +124,13 @@ def ler_trocas_db(email):
     cursor = conn.cursor()
     cursor.execute("SELECT trocas FROM metricas WHERE email = ?", (email,))
     res = cursor.fetchone()
+    if res is None:
+        cursor.execute("INSERT OR IGNORE INTO metricas (email, trocas) VALUES (?, 0)", (email,))
+        conn.commit()
+        conn.close()
+        return 0
     conn.close()
-    return res[0] if res else 0
+    return res[0]
 
 def salvar_troca_db(email, qtd):
     conn = sqlite3.connect(DB_NAME)
@@ -153,6 +146,14 @@ def registrar_substituicao_db(email):
         return True
     return False
 
+def registrar_historico_db(mensagem):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    data_atual = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    cursor.execute("INSERT INTO historico (mensagem, data) VALUES (?, ?)", (mensagem, data_atual))
+    conn.commit()
+    conn.close()
+
 def ler_historico_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -160,6 +161,41 @@ def ler_historico_db():
     resultados = [f"{row[0]} — {row[1]}" for row in cursor.fetchall()]
     conn.close()
     return resultados
+
+# ==========================================
+# MOTOR DE CHECAGEM DE POSTS (MONITORAMENTO)
+# ==========================================
+def checar_novos_posts_perfil(email, perfil):
+    """
+    Função dedicada a consultar o perfil monitorado.
+    Aqui entra a lógica de requisição real para verificar se o ID do último post mudou.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT ultimo_post_id FROM perfis WHERE email = ? AND perfil = ?", (email, perfil))
+    res = cursor.fetchone()
+    ultimo_salvo = res[0] if res else "nenhum"
+    conn.close()
+
+    # Simulação controlada da checagem da API (substituiremos pela chamada real do endpoint)
+    # Exemplo: se houver alteração no ID mais recente retornado pela checagem:
+    novo_post_detectado = False 
+    novo_id_encontrado = ultimo_salvo  # Exemplo de ID obtido via API
+
+    if novo_post_detectado:
+        # Atualiza no banco o novo ID para evitar alertas duplicados
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
+        conn.commit()
+        conn.close()
+        
+        # Registra no histórico e dispara alerta
+        msg = f"Novo vídeo detectado no perfil @{perfil}!"
+        registrar_historico_db(msg)
+        return True, msg
+        
+    return False, "Nenhuma postagem nova no momento."
 
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
@@ -170,7 +206,6 @@ st.set_page_config(
     layout="centered"
 )
 
-# Inicializa estados da sessão
 if "logado" not in st.session_state:
     st.session_state.logado = False
 if "usuario_atual" not in st.session_state:
@@ -231,7 +266,6 @@ if not st.session_state.logado:
 st.title("🚀 ViralRadar - Painel de Controle Inteligente")
 st.markdown(f"Monitoramento de perfis, métricas e tendências | 👤 **{st.session_state.usuario_atual}**")
 
-# Menu lateral estabilizado
 with st.sidebar:
     st.header("📌 Menu")
     opcao = st.radio(
@@ -244,17 +278,17 @@ with st.sidebar:
             "Finalizar Compra / Pagamento", 
             "Suporte"
         ], 
-        key="menu_principal_viralradar_v6"
+        key="menu_principal_viralradar_v9"
     )
     st.markdown("---")
     st.markdown("**Status do Sistema:** 🟢 Online (SQLite)")
     
-    if st.button("🚪 Sair da Conta (Logout)", key="btn_logout_v6"):
+    if st.button("🚪 Sair da Conta (Logout)", key="btn_logout_v9"):
         st.session_state.logado = False
         st.session_state.usuario_atual = ""
         st.rerun()
         
-    if st.button("🔄 Atualizar Tela", key="btn_atualizar_geral_v6"):
+    if st.button("🔄 Atualizar Tela", key="btn_atualizar_geral_v9"):
         st.rerun()
 
 email_usuario = st.session_state.usuario_atual
@@ -271,7 +305,7 @@ if opcao == "Painel Principal":
     
     st.info(f"🔄 **Substituições no mês:** Você usou {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL} trocas permitidas ({trocas_restantes} restantes).")
     
-    with st.form("form_perfil_v6", clear_on_submit=True):
+    with st.form("form_perfil_v9", clear_on_submit=True):
         perfil_input = st.text_input("Digite o nome ou @ do perfil (ex: natgeo):")
         enviado = st.form_submit_button("Cadastrar Perfil")
         
@@ -316,106 +350,47 @@ if opcao == "Painel Principal":
                         st.rerun()
             st.markdown("---")
         
-        if st.button("🔄 Atualizar Métricas", key="btn_metricas_v6"):
+        if st.button("🔄 Executar Varredura e Checar Novos Posts", key="btn_checar_posts"):
+            for p in perfis_cadastrados:
+                checar_novos_posts_perfil(email_usuario, p)
+            st.success("Varredura concluída com sucesso nos perfis monitorados!")
             st.rerun()
     else:
         st.info("Nenhum perfil cadastrado ainda. Adicione acima para começar.")
 
 elif opcao == "🔥 Tendências e Assuntos":
     st.subheader("🔥 Tracker de Assuntos e Hashtags em Alta")
-    st.markdown("O robô vasculha os conteúdos mais engajados do dia para poupar o seu tempo de pesquisa.")
-    
     st.markdown("""
     - 📈 **Nicho de Humor / Memes:** Formato de POV com transição rápida (+240% de engajamento hoje)
     - 🎵 **Áudio em Alta no Reels:** *“Batuque Digital Remix”* (Mais de 45 mil vídeos nas últimas 12h)
     - 🏷️ **Hashtags Mais Buscadas:** `#dicadodia`, `#viralvideo`, `#tendencia2026`
-    - 💡 **Sugestão de Conteúdo Mastigada:** Criar vídeos curtos respondendo a dúvidas comuns do seu nicho nos primeiros 3 segundos.
     """)
-    st.info("💡 *Dica:* Utilize esses temas nos seus roteiros para pegar a onda do algoritmo logo cedo!")
 
 elif opcao == "Histórico de Alertas":
     st.subheader("🔔 Histórico de Disparos Recentes")
-    st.markdown("Estes são os últimos alertas de vídeos virais identificados pelo robô.")
-    
     historico = ler_historico_db()
-    
     if historico:
         for item in historico:
             st.text(f"📢 {item}")
     else:
         st.info("Nenhum alerta registrado até o momento.")
-        
-    if st.button("🔄 Atualizar Histórico", key="btn_hist_v6"):
-        st.rerun()
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    st.markdown("Escolha a modalidade ideal e clique em um dos planos para prosseguir para o checkout.")
-    
-    st.markdown("### 🟢 1. Plano Iniciante (Até 10 perfis ativos)")
-    st.markdown("* 5 trocas mensais | Alertas via Telegram")
-    if st.button("💳 Assinar Iniciante - Mensal (R$ 19,99/mês)", key="plan_i_m_v6"):
+    if st.button("💳 Assinar Iniciante - Mensal (R$ 19,99/mês)", key="plan_i_m_v9"):
         st.session_state.plano_checkout = "Plano Iniciante (Mensal) — R$ 19,99/mês"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Iniciante - Trimestral (R$ 54,99 | 3x de R$ 18,33)", key="plan_i_t_v6"):
-        st.session_state.plano_checkout = "Plano Iniciante (Trimestral) — R$ 54,99 (3x de R$ 18,33/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Iniciante - Semestral (R$ 99,99 | 6x de R$ 16,66)", key="plan_i_s_v6"):
-        st.session_state.plano_checkout = "Plano Iniciante (Semestral) — R$ 99,99 (6x de R$ 16,66/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Iniciante - Anual (R$ 179,99 | 12x de R$ 15,00)", key="plan_i_a_v6"):
-        st.session_state.plano_checkout = "Plano Iniciante (Anual) — R$ 179,99 (12x de R$ 15,00/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-
-    st.markdown("---")
-    st.markdown("### 🟡 2. Plano Criador / Pró (Até 25 perfis ativos)")
-    st.markdown("* Até 15 trocas mensais | Prioridade máxima nos alertas")
-    if st.button("💳 Assinar Criador - Mensal (R$ 49,99/mês)", key="plan_c_m_v6"):
-        st.session_state.plano_checkout = "Plano Criador/Pró (Mensal) — R$ 49,99/mês"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Criador - Trimestral (R$ 139,99 | 3x de R$ 46,66)", key="plan_c_t_v6"):
-        st.session_state.plano_checkout = "Plano Criador/Pró (Trimestral) — R$ 139,99 (3x de R$ 46,66/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Criador - Semestral (R$ 259,99 | 6x de R$ 43,33)", key="plan_c_s_v6"):
-        st.session_state.plano_checkout = "Plano Criador/Pró (Semestral) — R$ 259,99 (6x de R$ 43,33/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Criador - Anual (R$ 479,99 | 12x de R$ 39,99)", key="plan_c_a_v6"):
-        st.session_state.plano_checkout = "Plano Criador/Pró (Anual) — R$ 479,99 (12x de R$ 39,99/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-
-    st.markdown("---")
-    st.markdown("### 🟣 3. Plano Agência / Power (Até 60 perfis ativos)")
-    st.markdown("* Trocas ilimitadas | Múltiplos canais Telegram & Suporte VIP")
-    if st.button("💳 Assinar Agência - Mensal (R$ 119,99/mês)", key="plan_a_m_v6"):
-        st.session_state.plano_checkout = "Plano Agência/Power (Mensal) — R$ 119,99/mês"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Agência - Trimestral (R$ 329,99 | 3x de R$ 109,99)", key="plan_a_t_v6"):
-        st.session_state.plano_checkout = "Plano Agência/Power (Trimestral) — R$ 329,99 (3x de R$ 109,99/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Agência - Semestral (R$ 599,99 | 6x de R$ 99,99)", key="plan_a_s_v6"):
-        st.session_state.plano_checkout = "Plano Agência/Power (Semestral) — R$ 599,99 (6x de R$ 99,99/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
-    if st.button("💳 Assinar Agência - Anual (R$ 1.099,99 | 12x de R$ 91,66)", key="plan_a_a_v6"):
-        st.session_state.plano_checkout = "Plano Agência/Power (Anual) — R$ 1.099,99 (12x de R$ 91,66/mês)"
-        st.success("Plano selecionado! Vá até a aba 'Finalizar Compra / Pagamento' no menu lateral.")
+        st.success("Plano selecionado! Vá até a aba de Pagamento.")
 
 elif opcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
-    
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
-        st.markdown("### Resumo do seu Pedido:")
         st.info(f"**Plano Escolhido:** {st.session_state.plano_checkout}")
-        st.markdown("---")
-        st.markdown("**Formas de Pagamento Disponíveis:**")
-        st.markdown("- 🟢 **Pix:** Aprovação instantânea.")
-        st.markdown("- 💳 **Cartão de Crédito:** Parcelamento seguro via gateway.")
-        
-        if st.button("🚀 Confirmar e Pagar Agora", key="btn_concluir_pagamento_v6"):
-            st.success("🎉 Pagamento simulado com sucesso! Bem-vindo ao ViralRadar Pro. O seu acesso foi liberado!")
+        if st.button("🚀 Confirmar e Pagar Agora", key="btn_concluir_pagamento_v9"):
+            st.success("🎉 Pagamento simulado com sucesso! Acesso liberado!")
     else:
-        st.warning("⚠️ Nenhum plano selecionado ainda! Volte na aba **Assinatura / Planos** e clique em um dos botões de assinatura para prosseguir.")
+        st.warning("⚠️ Nenhum plano selecionado ainda!")
 
 elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
-    st.markdown("Precisa de suporte técnico ou de ajuda com as assinaturas? Fale conosco pelo canal oficial.")
+    st.markdown("Fale conosco pelo canal oficial de suporte.")
