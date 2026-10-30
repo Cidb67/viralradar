@@ -378,13 +378,11 @@ if opcao == "Painel Principal":
                 perfil_limpo = perfil_input.replace("@", "").strip().lower()
                 
                 if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
-                    # Se atingiu o limite máximo, para cadastrar outro só gastando troca (substituição)
                     if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
                         st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} perfis atingido e suas trocas mensais esgotaram!")
                     else:
                         st.warning("⚠️ Limite de perfis atingido. Exclua um perfil existente ou utilize suas trocas.")
                 else:
-                    # Cadastro normal dentro do limite do plano (NÃO consome trocas mensais)
                     sucesso, status = salvar_perfil_db(email_usuario, perfil_limpo)
                     if sucesso:
                         st.success(f"Perfil '@{perfil_limpo}' cadastrado com sucesso!")
@@ -410,7 +408,6 @@ if opcao == "Painel Principal":
             with bcol3:
                 if st.button(f"🗑️ Excluir", key=f"excluir_{p}"):
                     if excluir_perfil_db(email_usuario, p):
-                        # Consome 1 troca mensal apenas se o usuário já havia preenchido todas as vagas iniciais
                         if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
                             registrar_substituicao_db(email_usuario)
                         st.success(f"Perfil @{p} removido!")
@@ -466,7 +463,7 @@ elif opcao == "Assinatura / Planos":
         st.session_state.plano_checkout = "Plano Iniciante (Mensal) — R$ 19,99/mês"
         st.success("Plano selecionado! Vá até a aba de Pagamento.")
 
-elifopcao == "Finalizar Compra / Pagamento":
+elif opcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
