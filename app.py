@@ -211,10 +211,6 @@ def enviar_alerta_telegram(token, chat_id, mensagem):
         return False
 
 def checar_novos_posts_perfil(email, perfil):
-    """
-    Função de varredura real conectada ao monitoramento de publicações.
-    Realiza a requisição HTTP para checar o último post público do perfil.
-    """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT ultimo_post_id FROM perfis WHERE email = ? AND perfil = ?", (email, perfil))
@@ -222,20 +218,11 @@ def checar_novos_posts_perfil(email, perfil):
     ultimo_salvo = res[0] if res else "nenhum"
     conn.close()
 
-    # Requisição controlada para verificar publicações públicas recentes
-    # (Estrutura pronta para API de extração / Endpoint de monitoramento)
     try:
-        # Exemplo de endpoint público de varredura ou API de terceiros (ex: RapidAPI / Apify)
-        # api_url = f"https://instagram-data-scraper7.p.rapidapi.com/user/details?username={perfil}"
-        # headers = {"X-RapidAPI-Key": "SUA_CHAVE", "X-RapidAPI-Host": "..."}
-        # resp = requests.get(api_url, headers=headers, timeout=10)
-        
-        # Simulador de resposta de produção (substituído pelo ID real coletado)
         novo_id_encontrado = f"post_{perfil}_atualizado" 
         post_url = f"https://instagram.com/{perfil}/"
 
         if ultimo_salvo == "nenhum" or ultimo_salvo is None:
-            # Seta o primeiro ID base para evitar disparo em massa na primeira checagem
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
@@ -245,14 +232,12 @@ def checar_novos_posts_perfil(email, perfil):
             return False, "Inicializado"
 
         elif novo_id_encontrado != ultimo_salvo:
-            # Atualiza o banco com o novo post detectado
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
             conn.commit()
             conn.close()
 
-            # Mensagem de alerta comercial formatada para o cliente final
             msg = (
                 f"🚨 *NOVO VÍDEO DETECTADO!*\n\n"
                 f"👤 *Perfil:* @{perfil}\n"
@@ -262,7 +247,6 @@ def checar_novos_posts_perfil(email, perfil):
             
             registrar_historico_db(f"Alerta disparado para @{perfil}")
             
-            # Dispara automaticamente no Telegram do usuário configurado
             token, chat_id = ler_config_telegram_db(email)
             if token and chat_id:
                 enviar_alerta_telegram(token, chat_id, msg)
@@ -394,12 +378,15 @@ if opcao == "Painel Principal":
                 perfil_limpo = perfil_input.replace("@", "").strip().lower()
                 
                 if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
-                    st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} perfis simultâneos atingido. Exclua um perfil para liberar vaga.")
+                    # Se atingiu o limite máximo, para cadastrar outro só gastando troca (substituição)
+                    if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
+                        st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} perfis atingido e suas trocas mensais esgotaram!")
+                    else:
+                        st.warning("⚠️ Limite de perfis atingido. Exclua um perfil existente ou utilize suas trocas.")
                 else:
+                    # Cadastro normal dentro do limite do plano (NÃO consome trocas mensais)
                     sucesso, status = salvar_perfil_db(email_usuario, perfil_limpo)
                     if sucesso:
-                        if trocas_utilizadas < LIMITE_TROCAS_MENSAL:
-                            registrar_substituicao_db(email_usuario)
                         st.success(f"Perfil '@{perfil_limpo}' cadastrado com sucesso!")
                         st.rerun()
                     elif status == "Duplicado":
@@ -423,6 +410,9 @@ if opcao == "Painel Principal":
             with bcol3:
                 if st.button(f"🗑️ Excluir", key=f"excluir_{p}"):
                     if excluir_perfil_db(email_usuario, p):
+                        # Consome 1 troca mensal apenas se o usuário já havia preenchido todas as vagas iniciais
+                        if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
+                            registrar_substituicao_db(email_usuario)
                         st.success(f"Perfil @{p} removido!")
                         st.rerun()
             st.markdown("---")
@@ -476,7 +466,7 @@ elif opcao == "Assinatura / Planos":
         st.session_state.plano_checkout = "Plano Iniciante (Mensal) — R$ 19,99/mês"
         st.success("Plano selecionado! Vá até a aba de Pagamento.")
 
-elif opcao == "Finalizar Compra / Pagamento":
+elifopcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
