@@ -6,7 +6,8 @@ import requests
 import json
 import io
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.chart import BarChart, Reference
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -433,24 +434,163 @@ def linhas_relatorio(perfis, snapshots):
     return linhas
 
 
-def gerar_excel(linhas):
+def data_excel(valor):
+    """Converte data ISO do YouTube em datetime sem fuso para o Excel."""
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def ler_evolucao_db(email, perfis):
+    """Histórico REAL das medições armazenadas; não inventa crescimento."""
+    if not perfis:
+        return []
+    with sqlite3.connect(DB_NAME) as conn:
+        dados = conn.execute("""SELECT vm.canal_id, vm.video_id, vm.coletado_em,
+                              vm.visualizacoes, vm.curtidas, vm.comentarios
+                              FROM video_metricas vm WHERE vm.email=?
+                              ORDER BY vm.video_id, vm.coletado_em""", (email,)).fetchall()
+    return dados
+
+
+def gerar_excel(linhas, historico=None):
+    """Relatório de 4 abas com dados reais das últimas consultas."""
+    historico = historico or []
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Vídeos monitorados"
-    colunas = ["Perfil", "Nome do canal", "Rede", "Posição", "Título",
-               "Publicado em (UTC)", "Visualizações", "Variação de visualizações",
-               "Curtidas", "Comentários", "Link", "Consultado em (UTC)"]
-    ws.append(colunas)
-    for celula in ws[1]:
-        celula.font = Font(bold=True, color="FFFFFF")
-        celula.fill = PatternFill("solid", fgColor="183153")
-    for linha in linhas:
-        ws.append([linha.get(coluna) for coluna in colunas])
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for col in ws.columns:
-        letra = col[0].column_letter
-        ws.column_dimensions[letra].width = min(55, max(14, max(len(str(c.value or "")) for c in col) + 2))
+    resumo = wb.active
+    resumo.title = "Resumo Geral"
+    publicacoes = wb.create_sheet("Publicações")
+    evolucao = wb.create_sheet("Evolução")
+    graficos = wb.create_sheet("Gráficos")
+    azul, claro, verde = "183153", "EAF0F7", "167D63"
+
+    def titulo(ws, texto, ultima_coluna):
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ultima_coluna)
+        c = ws.cell(1, 1, texto)
+        c.font = Font(name="Aptos Display", size=16, bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=azul)
+        c.alignment = Alignment(vertical="center")
+        ws.row_dimensions[1].height = 32
+        ws.sheet_view.showGridLines = False
+
+    def cabecalho(ws, row, labels):
+        for col, label in enumerate(labels, 1):
+            cell = ws.cell(row, col, label)
+            cell.fill = PatternFill("solid", fgColor=azul)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        ws.row_dimensions[row].height = 29
+        ws.freeze_panes = f"A{row+1}"
+
+    def faixa(ws, row, n):
+        if row % 2 == 0:
+            for col in range(1, n + 1):
+                ws.cell(row, col).fill = PatternFill("solid", fgColor=claro)
+
+    titulo(resumo, "VIRALRADAR | Resumo de monitoramento", 6)
+    resumo["A3"] = "Gerado em (UTC)"
+    resumo["B3"] = datetime.now(timezone.utc).replace(tzinfo=None)
+    resumo["B3"].number_format = "dd/mm/yyyy hh:mm"
+    resumo["A4"] = "Fonte: últimas consultas salvas no ViralRadar; somente YouTube integrado."
+    resumo.merge_cells("A4:F4")
+    cabecalho(resumo, 6, ["Perfil", "Rede", "Vídeos exibidos", "Views acumuladas*", "Curtidas*", "Comentários*"])
+    grupos = {}
+    for item in linhas:
+        chave = (item.get("Nome do canal") or item.get("Perfil"), item.get("Rede"))
+        grupos.setdefault(chave, []).append(item)
+    for idx, ((perfil, rede), itens) in enumerate(sorted(grupos.items()), 7):
+        valores = [perfil, rede, len(itens)]
+        for campo in ("Visualizações", "Curtidas", "Comentários"):
+            nums = [x[campo] for x in itens if isinstance(x.get(campo), (int, float))]
+            valores.append(sum(nums) if nums else None)
+        for col, val in enumerate(valores, 1):
+            resumo.cell(idx, col, val)
+        faixa(resumo, idx, 6)
+        for col in (4, 5, 6):
+            resumo.cell(idx, col).number_format = '#,##0'
+    aviso_row = 8 + len(grupos)
+    resumo.cell(aviso_row, 1, "* Totais dos vídeos exibidos; não representam todas as publicações do canal.")
+    resumo.merge_cells(start_row=aviso_row, start_column=1, end_row=aviso_row, end_column=6)
+    resumo.auto_filter.ref = f"A6:F{max(7, 6+len(grupos))}"
+    for col, largura in {"A":32,"B":16,"C":20,"D":24,"E":20,"F":22}.items():
+        resumo.column_dimensions[col].width = largura
+
+    titulo(publicacoes, "VIRALRADAR | Publicações monitoradas", 11)
+    cabecalho(publicacoes, 3, ["Perfil", "Rede", "Data da publicação (UTC)", "Título", "Visualizações",
+                               "Crescimento desde consulta anterior", "Curtidas", "Comentários",
+                               "Link do vídeo", "Última consulta (UTC)", "ID do vídeo"])
+    for row, item in enumerate(linhas, 4):
+        link = item.get("Link") or ""
+        valores = [item.get("Nome do canal") or item.get("Perfil"), item.get("Rede"),
+                   data_excel(item.get("Publicado em (UTC)")), item.get("Título"),
+                   item.get("Visualizações"), item.get("Variação de visualizações"),
+                   item.get("Curtidas"), item.get("Comentários"), link,
+                   data_excel(item.get("Consultado em (UTC)")),
+                   link.split("v=")[-1].split("&")[0] if "v=" in link else ""]
+        for col, valor in enumerate(valores, 1):
+            cel = publicacoes.cell(row, col, valor)
+            if col in (3, 10):
+                cel.number_format = "dd/mm/yyyy hh:mm"
+            if col in (5, 6, 7, 8):
+                cel.number_format = '#,##0'
+        if link.startswith("https://www.youtube.com/"):
+            cel = publicacoes.cell(row, 9)
+            cel.hyperlink = link
+            cel.font = Font(color="0563C1", underline="single")
+        faixa(publicacoes, row, 11)
+    publicacoes.auto_filter.ref = f"A3:K{max(4,3+len(linhas))}"
+    for col, largura in {"A":29,"B":15,"C":24,"D":53,"E":20,"F":28,"G":17,"H":19,"I":48,"J":24,"K":19}.items():
+        publicacoes.column_dimensions[col].width = largura
+
+    titulo(evolucao, "VIRALRADAR | Histórico de medições", 7)
+    evolucao["A2"] = "Cada linha representa uma coleta salva. A evolução só existe após duas ou mais consultas."
+    evolucao.merge_cells("A2:G2")
+    cabecalho(evolucao, 4, ["Canal ID", "Vídeo ID", "Consulta (UTC)", "Visualizações", "Curtidas", "Comentários", "Variação de views"])
+    anterior = {}
+    for row, (canal, video, coleta, views, likes, comentarios) in enumerate(historico, 5):
+        chave = (canal, video)
+        previa = anterior.get(chave)
+        delta = views - previa if views is not None and previa is not None else None
+        anterior[chave] = views
+        vals = [canal, video, data_excel(coleta), views, likes, comentarios, delta]
+        for col, val in enumerate(vals, 1):
+            cell = evolucao.cell(row, col, val)
+            if col == 3: cell.number_format = "dd/mm/yyyy hh:mm"
+            if col in (4, 5, 6, 7): cell.number_format = '#,##0'
+        faixa(evolucao, row, 7)
+    evolucao.auto_filter.ref = f"A4:G{max(5,4+len(historico))}"
+    for col, largura in {"A":32,"B":23,"C":25,"D":22,"E":18,"F":18,"G":23}.items():
+        evolucao.column_dimensions[col].width = largura
+
+    titulo(graficos, "VIRALRADAR | Comparativo de publicações", 5)
+    graficos["A3"] = "Comparação de visualizações dos vídeos exibidos na aba Publicações."
+    cabecalho(graficos, 5, ["Vídeo (perfil + data)", "Visualizações"])
+    ordenadas = sorted([x for x in linhas if isinstance(x.get("Visualizações"), (int, float))],
+                       key=lambda x: x["Visualizações"], reverse=True)[:20]
+    for row, item in enumerate(ordenadas, 6):
+        dt = data_excel(item.get("Publicado em (UTC)"))
+        rotulo = f"{item.get('Nome do canal') or item.get('Perfil')} | {dt.strftime('%d/%m/%Y') if dt else 's/data'} | {str(item.get('Título',''))[:24]}"
+        graficos.cell(row, 1, rotulo)
+        graficos.cell(row, 2, item["Visualizações"])
+        graficos.cell(row, 2).number_format = '#,##0'
+        faixa(graficos, row, 2)
+    graficos.column_dimensions["A"].width = 72
+    graficos.column_dimensions["B"].width = 24
+    if ordenadas:
+        chart = BarChart()
+        chart.type = "bar"
+        chart.title = "Visualizações por publicação (até 20 vídeos)"
+        chart.y_axis.title = "Publicação"
+        chart.x_axis.title = "Visualizações"
+        chart.height = 11
+        chart.width = 23
+        chart.add_data(Reference(graficos, min_col=2, min_row=5, max_row=5+len(ordenadas)), titles_from_data=True)
+        chart.set_categories(Reference(graficos, min_col=1, min_row=6, max_row=5+len(ordenadas)))
+        graficos.add_chart(chart, "D5")
+
     saida = io.BytesIO()
     wb.save(saida)
     return saida.getvalue()
@@ -574,7 +714,7 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("📡 ViralRadar 3.0 — Central multirredes")
+    st.subheader("📡 ViralRadar 3.1 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
     st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
 
@@ -610,6 +750,21 @@ if opcao == "Painel Principal":
                     progresso.progress((idx + 1) / len(perfis_cadastrados))
             st.rerun()
 
+        st.markdown("#### 🔎 Consultar um canal específico")
+        perfil_selecionado = st.selectbox("Escolha o canal para consultar:",
+                                         perfis_cadastrados, key="seletor_consulta_individual_v31")
+        if st.button("🔎 Consultar canal selecionado", key="consultar_selecionado_v31"):
+            with st.spinner(f"Consultando {perfil_selecionado}..."):
+                novo, mensagem, painel_novo = checar_novos_posts_perfil(email_usuario, perfil_selecionado)
+                salvar_snapshot(email_usuario, perfil_selecionado, painel_novo, novo)
+            if painel_novo is None:
+                st.error(mensagem)
+            else:
+                st.session_state["resultado_consulta_v31"] = mensagem
+                st.rerun()
+        if st.session_state.get("resultado_consulta_v31"):
+            st.info(st.session_state.pop("resultado_consulta_v31"))
+
         snapshots = ler_snapshots(email_usuario)
         st.caption("A tabela abaixo lê os últimos resultados salvos, sem consumir a API ao abrir a página.")
         cab = st.columns([3, 2, 2, 2, 2, 2])
@@ -623,6 +778,12 @@ if opcao == "Painel Principal":
             nome = painel.get("nome", perfil) if painel else perfil
             colunas = st.columns([3, 2, 2, 2, 2, 2])
             colunas[0].write(nome)
+            if dado and dado.get("atualizado"):
+                data_consulta = data_excel(dado["atualizado"])
+                if data_consulta:
+                    colunas[0].caption(f"Última consulta: {data_consulta.strftime('%d/%m/%Y %H:%M')} UTC")
+            else:
+                colunas[0].caption("Ainda não consultado")
             if ultimo:
                 simbolo = "🟢" if dado["novo"] else "⚪"
                 colunas[1].write(f"{simbolo} {formato_views(ultimo.get('visualizacoes'))}")
@@ -655,12 +816,12 @@ if opcao == "Painel Principal":
         linhas = linhas_relatorio(perfis_cadastrados, snapshots)
         if linhas:
             x, y = st.columns(2)
-            x.download_button("📊 Baixar Excel (.xlsx)", gerar_excel(linhas),
+            x.download_button("📊 Baixar Excel (.xlsx)", gerar_excel(linhas, ler_evolucao_db(email_usuario, perfis_cadastrados)),
                               file_name="viralradar_relatorio.xlsx",
                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             y.download_button("📄 Baixar TXT", gerar_txt(linhas).encode("utf-8-sig"),
                               file_name="viralradar_relatorio.txt", mime="text/plain")
-            st.caption(f"{len(linhas)} vídeos no relatório, com métricas da última consulta registrada.")
+            st.caption(f"{len(linhas)} vídeos no relatório. Excel profissional com Resumo Geral, Publicações, Evolução e Gráficos.")
         else:
             st.info("Execute a primeira consulta para habilitar os relatórios.")
     else:
