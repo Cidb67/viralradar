@@ -501,3 +501,52 @@ elif opcao == "Finalizar Compra / Pagamento":
 elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
     st.markdown("Fale conosco pelo canal oficial de suporte do ViralRadar.")
+
+# ==========================================
+# TESTE REAL DA API DO YOUTUBE
+# ==========================================
+
+def testar_api_youtube():
+    try:
+        api_key = st.secrets["YOUTUBE_API_KEY"]
+
+        resposta = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet",
+                "chart": "mostPopular",
+                "regionCode": "BR",
+                "maxResults": 1,
+                "key": api_key
+            },
+            timeout=15
+        )
+
+        dados = resposta.json()
+
+        if resposta.status_code == 200:
+            st.success("YouTube conectado com sucesso!")
+
+            for video in dados.get("items", []):
+                st.write(
+                    "Vídeo encontrado:",
+                    video["snippet"]["title"]
+                )
+        else:
+            st.error(
+                dados.get("error", {}).get(
+                    "message", "Erro desconhecido"
+                )
+            )
+
+    except KeyError:
+        st.error("Chave API não encontrada nos Secrets.")
+    except requests.RequestException as erro:
+        st.error(f"Erro de conexão: {erro}")
+
+
+st.divider()
+st.subheader("Teste de conexão com YouTube")
+
+if st.button("Testar API do YouTube"):
+    testar_api_youtube()
