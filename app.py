@@ -8,6 +8,7 @@ import io
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -444,7 +445,7 @@ def data_excel(valor):
         return None
 
 
-def ler_evolucao_db(email, perfis):
+def ler_evolucao_db(email, perfis, snapshots=None):
     """Histórico REAL das medições armazenadas; não inventa crescimento."""
     if not perfis:
         return []
@@ -453,6 +454,12 @@ def ler_evolucao_db(email, perfis):
                               vm.visualizacoes, vm.curtidas, vm.comentarios
                               FROM video_metricas vm WHERE vm.email=?
                               ORDER BY vm.video_id, vm.coletado_em""", (email,)).fetchall()
+    if snapshots is not None:
+        # Filtra o histórico pelos vídeos pertencentes aos canais escolhidos.
+        # Cada vídeo tem um ID exclusivo no YouTube.
+        ids = {video.get("id") for perfil in perfis
+               for video in (snapshots.get(perfil, {}).get("painel") or {}).get("videos", [])}
+        dados = [registro for registro in dados if registro[1] in ids]
     return dados
 
 
@@ -518,31 +525,36 @@ def gerar_excel(linhas, historico=None):
     for col, largura in {"A":32,"B":16,"C":20,"D":24,"E":20,"F":22}.items():
         resumo.column_dimensions[col].width = largura
 
-    titulo(publicacoes, "VIRALRADAR | Publicações monitoradas", 11)
+    titulo(publicacoes, "VIRALRADAR | Publicações monitoradas", 12)
     cabecalho(publicacoes, 3, ["Perfil", "Rede", "Data da publicação (UTC)", "Título", "Visualizações",
-                               "Crescimento desde consulta anterior", "Curtidas", "Comentários",
+                               "Crescimento (views)", "Crescimento (%)", "Curtidas", "Comentários",
                                "Link do vídeo", "Última consulta (UTC)", "ID do vídeo"])
     for row, item in enumerate(linhas, 4):
         link = item.get("Link") or ""
+        atual = item.get("Visualizações")
+        delta = item.get("Variação de visualizações")
+        anterior_views = atual - delta if isinstance(atual, (int, float)) and isinstance(delta, (int, float)) else None
+        percentual = delta / anterior_views if anterior_views is not None and anterior_views > 0 else None
         valores = [item.get("Nome do canal") or item.get("Perfil"), item.get("Rede"),
                    data_excel(item.get("Publicado em (UTC)")), item.get("Título"),
-                   item.get("Visualizações"), item.get("Variação de visualizações"),
-                   item.get("Curtidas"), item.get("Comentários"), link,
+                   atual, delta, percentual, item.get("Curtidas"), item.get("Comentários"), link,
                    data_excel(item.get("Consultado em (UTC)")),
                    link.split("v=")[-1].split("&")[0] if "v=" in link else ""]
         for col, valor in enumerate(valores, 1):
             cel = publicacoes.cell(row, col, valor)
-            if col in (3, 10):
+            if col in (3, 11):
                 cel.number_format = "dd/mm/yyyy hh:mm"
-            if col in (5, 6, 7, 8):
+            if col in (5, 6, 8, 9):
                 cel.number_format = '#,##0'
+            if col == 7:
+                cel.number_format = '0.0%'
         if link.startswith("https://www.youtube.com/"):
-            cel = publicacoes.cell(row, 9)
+            cel = publicacoes.cell(row, 10)
             cel.hyperlink = link
             cel.font = Font(color="0563C1", underline="single")
-        faixa(publicacoes, row, 11)
-    publicacoes.auto_filter.ref = f"A3:K{max(4,3+len(linhas))}"
-    for col, largura in {"A":29,"B":15,"C":24,"D":53,"E":20,"F":28,"G":17,"H":19,"I":48,"J":24,"K":19}.items():
+        faixa(publicacoes, row, 12)
+    publicacoes.auto_filter.ref = f"A3:L{max(4,3+len(linhas))}"
+    for col, largura in {"A":29,"B":15,"C":24,"D":53,"E":20,"F":23,"G":19,"H":17,"I":19,"J":48,"K":24,"L":19}.items():
         publicacoes.column_dimensions[col].width = largura
 
     titulo(evolucao, "VIRALRADAR | Histórico de medições", 7)
@@ -565,31 +577,58 @@ def gerar_excel(linhas, historico=None):
     for col, largura in {"A":32,"B":23,"C":25,"D":22,"E":18,"F":18,"G":23}.items():
         evolucao.column_dimensions[col].width = largura
 
-    titulo(graficos, "VIRALRADAR | Comparativo de publicações", 5)
-    graficos["A3"] = "Comparação de visualizações dos vídeos exibidos na aba Publicações."
-    cabecalho(graficos, 5, ["Vídeo (perfil + data)", "Visualizações"])
+    titulo(graficos, "VIRALRADAR | Gráficos de desempenho", 6)
+    graficos["A3"] = "Valores reais coletados. Cada barra identifica um vídeo; a legenda informa a métrica."
+    graficos.merge_cells("A3:C3")
+    cabecalho(graficos, 5, ["Vídeo (data + título)", "Visualizações", "Crescimento (views)"])
     ordenadas = sorted([x for x in linhas if isinstance(x.get("Visualizações"), (int, float))],
                        key=lambda x: x["Visualizações"], reverse=True)[:20]
+    tem_delta = False
     for row, item in enumerate(ordenadas, 6):
         dt = data_excel(item.get("Publicado em (UTC)"))
-        rotulo = f"{item.get('Nome do canal') or item.get('Perfil')} | {dt.strftime('%d/%m/%Y') if dt else 's/data'} | {str(item.get('Título',''))[:24]}"
+        rotulo = f"{dt.strftime('%d/%m/%Y') if dt else 's/data'} | {str(item.get('Título',''))[:38]}"
         graficos.cell(row, 1, rotulo)
         graficos.cell(row, 2, item["Visualizações"])
-        graficos.cell(row, 2).number_format = '#,##0'
-        faixa(graficos, row, 2)
-    graficos.column_dimensions["A"].width = 72
-    graficos.column_dimensions["B"].width = 24
+        delta = item.get("Variação de visualizações")
+        if isinstance(delta, (int, float)):
+            graficos.cell(row, 3, delta)
+            tem_delta = True
+        for col in (2, 3):
+            graficos.cell(row, col).number_format = '#,##0'
+        faixa(graficos, row, 3)
+    graficos.column_dimensions["A"].width = 68
+    graficos.column_dimensions["B"].width = 23
+    graficos.column_dimensions["C"].width = 25
     if ordenadas:
         chart = BarChart()
         chart.type = "bar"
-        chart.title = "Visualizações por publicação (até 20 vídeos)"
-        chart.y_axis.title = "Publicação"
+        chart.title = "Visualizações dos vídeos monitorados"
+        chart.y_axis.title = "Vídeo (publicação e título)"
         chart.x_axis.title = "Visualizações"
-        chart.height = 11
-        chart.width = 23
+        chart.height = max(9, min(18, len(ordenadas) * 0.8 + 5))
+        chart.width = 25
         chart.add_data(Reference(graficos, min_col=2, min_row=5, max_row=5+len(ordenadas)), titles_from_data=True)
         chart.set_categories(Reference(graficos, min_col=1, min_row=6, max_row=5+len(ordenadas)))
-        graficos.add_chart(chart, "D5")
+        chart.legend.position = "b"
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        graficos.add_chart(chart, "E5")
+        if tem_delta:
+            crescimento = BarChart()
+            crescimento.type = "bar"
+            crescimento.title = "Crescimento de visualizações desde a consulta anterior"
+            crescimento.y_axis.title = "Vídeo"
+            crescimento.x_axis.title = "Novas visualizações"
+            crescimento.height = chart.height
+            crescimento.width = 25
+            crescimento.add_data(Reference(graficos, min_col=3, min_row=5, max_row=5+len(ordenadas)), titles_from_data=True)
+            crescimento.set_categories(Reference(graficos, min_col=1, min_row=6, max_row=5+len(ordenadas)))
+            crescimento.legend.position = "b"
+            crescimento.dLbls = DataLabelList()
+            crescimento.dLbls.showVal = True
+            graficos.add_chart(crescimento, f"E{max(27, 8 + len(ordenadas) * 2)}")
+        else:
+            graficos.cell(7 + len(ordenadas), 1, "Aguardando uma segunda consulta para calcular o crescimento dos vídeos.")
 
     saida = io.BytesIO()
     wb.save(saida)
@@ -714,7 +753,7 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("📡 ViralRadar 3.1 — Central multirredes")
+    st.subheader("📡 ViralRadar 3.2 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
     st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
 
@@ -797,6 +836,15 @@ if opcao == "Painel Principal":
                     mostrar_resultados_youtube(painel)
                 else:
                     st.info("Ainda não consultado. Clique em atualizar todos.")
+                if dado and videos:
+                    linhas_canal = linhas_relatorio([perfil], {perfil: dado})
+                    historico_canal = ler_evolucao_db(email_usuario, [perfil], {perfil: dado})
+                    st.download_button(
+                        "📊 Baixar relatório Excel deste canal",
+                        data=gerar_excel(linhas_canal, historico_canal),
+                        file_name=f"viralradar_{''.join(c if c.isalnum() or c in '-_' else '_' for c in nome)[:45]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"excel_individual_{perfil}")
                 a, b = st.columns(2)
                 if a.button("🔄 Atualizar somente este perfil", key=f"atualizar_{perfil}"):
                     novo, mensagem, painel_novo = checar_novos_posts_perfil(email_usuario, perfil)
@@ -812,16 +860,17 @@ if opcao == "Painel Principal":
                     st.rerun()
 
         st.divider()
-        st.subheader("📥 Exportar relatórios")
+        st.subheader("📥 Relatório consolidado (todos os canais)")
+        st.caption("Para baixar um canal separadamente, abra 'Detalhes' do canal e use o botão Excel individual.")
         linhas = linhas_relatorio(perfis_cadastrados, snapshots)
         if linhas:
             x, y = st.columns(2)
-            x.download_button("📊 Baixar Excel (.xlsx)", gerar_excel(linhas, ler_evolucao_db(email_usuario, perfis_cadastrados)),
+            x.download_button("📊 Baixar Excel (.xlsx)", gerar_excel(linhas, ler_evolucao_db(email_usuario, perfis_cadastrados, snapshots)),
                               file_name="viralradar_relatorio.xlsx",
                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             y.download_button("📄 Baixar TXT", gerar_txt(linhas).encode("utf-8-sig"),
                               file_name="viralradar_relatorio.txt", mime="text/plain")
-            st.caption(f"{len(linhas)} vídeos no relatório. Excel profissional com Resumo Geral, Publicações, Evolução e Gráficos.")
+            st.caption(f"{len(linhas)} vídeos no consolidado. Excel com Resumo Geral, Publicações, Evolução e Gráficos.")
         else:
             st.info("Execute a primeira consulta para habilitar os relatórios.")
     else:
