@@ -193,10 +193,10 @@ def ler_historico_db():
     conn.close()
     return resultados
 
-def salvar_config_telegram_db(email, token, chat_id):
+def salvar_config_telegram_db(email, chat_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO configuracoes (email, telegram_token, telegram_chat_id) VALUES (?, ?, ?)", (email, token, chat_id))
+    cursor.execute("INSERT OR REPLACE INTO configuracoes (email, telegram_token, telegram_chat_id) VALUES (?, ?, ?)", (email, "", chat_id))
     conn.commit()
     conn.close()
 
@@ -207,6 +207,13 @@ def ler_config_telegram_db(email):
     res = cursor.fetchone()
     conn.close()
     return res if res else ("", "")
+
+
+def credenciais_telegram_usuario(email):
+    """Token protegido no Streamlit; Chat ID individual no cadastro do usuário."""
+    token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+    _, chat_id = ler_config_telegram_db(email)
+    return token, chat_id
 
 # ==========================================
 # MOTOR DE DISPARO E CHECAGEM (YOUTUBE + TELEGRAM)
@@ -222,9 +229,12 @@ def enviar_alerta_telegram(token, chat_id, mensagem):
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            # Nunca registrar a URL com o token nos logs.
+            print(f"Telegram: falha HTTP {response.status_code} no envio.")
         return response.status_code == 200
-    except Exception as e:
-        print(f"Erro ao disparar Telegram: {e}")
+    except requests.RequestException:
+        print("Telegram: falha de conexão no envio.")
         return False
 
 def consultar_youtube(endpoint, parametros):
@@ -331,7 +341,7 @@ def checar_novos_posts_perfil(email, canal):
                              (mais_recente, email, canal))
                 mensagem = f"{nome}: referência sincronizada; exibindo os últimos 5 vídeos."
             elif novos:
-                token, chat_id = ler_config_telegram_db(email)
+                token, chat_id = credenciais_telegram_usuario(email)
                 falha = False
                 for video_id in reversed(novos):
                     aviso = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\nhttps://www.youtube.com/watch?v={video_id}"
@@ -579,6 +589,10 @@ if opcao == "Painel Principal":
             else:
                 sucesso, status = salvar_perfil_db(email_usuario, perfil_input.strip())
                 if sucesso:
+                    token, chat_id = credenciais_telegram_usuario(email_usuario)
+                    if token and chat_id:
+                        enviar_alerta_telegram(token, chat_id,
+                            f"📡 ViralRadar: novo canal cadastrado para monitoramento: {perfil_input.strip()}")
                     st.success("Canal cadastrado. Execute a primeira consulta para carregar os dados.")
                     st.rerun()
                 else:
@@ -670,22 +684,34 @@ elif opcao == "Histórico de Alertas":
         st.info("Nenhum alerta registrado até o momento.")
 
 elif opcao == "Configurar Telegram":
-    st.subheader("🤖 Configurações do Bot do Telegram")
-    st.markdown("Insira o Token do seu Bot do Telegram e o Chat ID para receber os alertas instantâneos de novos vídeos.")
-    
-    token_atual, chat_id_atual = ler_config_telegram_db(email_usuario)
-    
-    with st.form("form_config_telegram"):
-        t_input = st.text_input("Telegram Bot Token:", value=token_atual, type="password")
-        c_input = st.text_input("Telegram Chat ID:", value=chat_id_atual)
-        btn_salvar_config = st.form_submit_button("Salvar Configurações")
-        
-        if btn_salvar_config:
-            salvar_config_telegram_db(email_usuario, t_input, c_input)
-            st.success("Configurações do Telegram salvas com sucesso!")
-            
-            if enviar_alerta_telegram(t_input, c_input, "🚀 *ViralRadar Conectado ao YouTube!* Alertas ativados."):
-                st.info("Mensagem de teste enviada para o seu Telegram!")
+    st.subheader("🤖 Configurações do Telegram")
+    token, chat_id_atual = credenciais_telegram_usuario(email_usuario)
+    if token:
+        st.success("Token do bot encontrado nos Secrets do Streamlit.")
+    else:
+        st.error("TELEGRAM_BOT_TOKEN não encontrado nos Secrets do Streamlit.")
+    st.caption("O Token é protegido no servidor. Cada usuário informa somente o seu Chat ID.")
+    with st.form("form_config_telegram_v31"):
+        chat_digitado = st.text_input("Seu Telegram Chat ID:", value=chat_id_atual,
+                                     help="Abra seu bot no Telegram e envie /start antes do teste.")
+        salvar = st.form_submit_button("💾 Salvar Chat ID")
+        if salvar:
+            chat_digitado = chat_digitado.strip()
+            if not chat_digitado or not (chat_digitado.lstrip("-").isdigit()):
+                st.warning("Informe um Chat ID numérico válido.")
+            else:
+                salvar_config_telegram_db(email_usuario, chat_digitado)
+                st.success("Chat ID salvo para esta conta!")
+                chat_id_atual = chat_digitado
+    if st.button("📨 Enviar mensagem de teste", disabled=not bool(token and chat_id_atual)):
+        if enviar_alerta_telegram(token, chat_id_atual,
+                "🚀 ViralRadar conectado! O envio de alertas do Telegram está funcionando."):
+            st.success("Mensagem enviada! Confira a conversa com seu bot no Telegram.")
+        else:
+            st.error("Não foi possível enviar. Confira o Chat ID e se você iniciou a conversa com /start.")
+    st.info("Nesta versão, o Chat ID é salvo no SQLite do Streamlit Cloud. "
+            "Ele pode desaparecer após reinicializações. Antes de vender assinaturas, "
+            "vamos migrar os cadastros para um banco persistente.")
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
@@ -728,51 +754,3 @@ elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
     st.markdown("Fale conosco pelo canal oficial de suporte do ViralRadar.")
 
-# ==========================================
-# TESTE REAL DA API DO YOUTUBE
-# ==========================================
-
-def testar_api_youtube():
-    try:
-        api_key = st.secrets["YOUTUBE_API_KEY"]
-
-        resposta = requests.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            params={
-                "part": "snippet",
-                "chart": "mostPopular",
-                "regionCode": "BR",
-                "maxResults": 1,
-                "key": api_key
-            },
-            timeout=15
-        )
-
-        dados = resposta.json()
-
-        if resposta.status_code == 200:
-            st.success("YouTube conectado com sucesso!")
-
-            for video in dados.get("items", []):
-                st.write(
-                    "Vídeo encontrado:",
-                    video["snippet"]["title"]
-                )
-        else:
-            st.error(
-                dados.get("error", {}).get(
-                    "message", "Erro desconhecido"
-                )
-            )
-
-    except KeyError:
-        st.error("Chave API não encontrada nos Secrets.")
-    except requests.RequestException as erro:
-        st.error(f"Erro de conexão: {erro}")
-
-
-st.divider()
-st.subheader("Teste de conexão com YouTube")
-
-if st.button("Testar API do YouTube"):
-    testar_api_youtube()
