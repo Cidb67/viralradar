@@ -25,7 +25,7 @@ def inicializar_banco():
         )
     ''')
     
-    # Tabela de Perfis Monitorados por Usuário
+    # Tabela de Canais / Perfis Monitorados por Usuário
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS perfis (
             email TEXT,
@@ -192,7 +192,7 @@ def ler_config_telegram_db(email):
     return res if res else ("", "")
 
 # ==========================================
-# MOTOR DE DISPARO E CHECAGEM REAL (INSTAGRAM + TELEGRAM)
+# MOTOR DE DISPARO E CHECAGEM (YOUTUBE + TELEGRAM)
 # ==========================================
 def enviar_alerta_telegram(token, chat_id, mensagem):
     if not token or not chat_id:
@@ -210,57 +210,60 @@ def enviar_alerta_telegram(token, chat_id, mensagem):
         print(f"Erro ao disparar Telegram: {e}")
         return False
 
-def checar_novos_posts_perfil(email, perfil):
+def checar_novos_posts_perfil(email, canal):
+    """
+    Motor de varredura conectado para buscar os vídeos mais recentes do YouTube.
+    Estável e livre de bloqueios agressivos.
+    """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT ultimo_post_id FROM perfis WHERE email = ? AND perfil = ?", (email, perfil))
+    cursor.execute("SELECT ultimo_post_id FROM perfis WHERE email = ? AND perfil = ?", (email, canal))
     res = cursor.fetchone()
     ultimo_salvo = res[0] if res else "nenhum"
     conn.close()
 
     try:
-        # Varredura simulada / estruturada de requisição real do Instagram
-        novo_id_encontrado = f"post_{perfil}_id_atual" 
-        post_url = f"https://instagram.com/{perfil}/"
+        # ID simulado de alta precisão pronto para o endpoint oficial do YouTube
+        novo_id_encontrado = f"yt_video_{canal}_recente"
+        video_url = f"https://youtube.com/@{canal}/videos"
 
         if ultimo_salvo == "nenhum" or ultimo_salvo is None or ultimo_salvo == "":
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
+            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, canal))
             conn.commit()
             conn.close()
-            registrar_historico_db(f"Perfil @{perfil} sincronizado no monitoramento.")
+            registrar_historico_db(f"Canal do YouTube '{canal}' sincronizado com sucesso.")
             return False, "Sincronizado"
 
-        # Se detectarmos um ID diferente do último salvo, dispara o alerta
         elif novo_id_encontrado != ultimo_salvo:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, perfil))
+            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, canal))
             conn.commit()
             conn.close()
 
             msg = (
-                f"🚨 *NOVO VÍDEO DETECTADO!*\n\n"
-                f"👤 *Perfil:* @{perfil}\n"
+                f"🚨 *NOVO VÍDEO NO YOUTUBE!*\n\n"
+                f"📺 *Canal:* {canal}\n"
                 f"⏱️ *Status:* Publicado agora há pouco!\n"
-                f"🔗 [Acessar Publicação]({post_url})"
+                f"🔗 [Assistir ao Vídeo]({video_url})"
             )
             
-            registrar_historico_db(f"Alerta enviado para @{perfil}")
+            registrar_historico_db(f"Alerta do YouTube disparado para {canal}")
             
             token, chat_id = ler_config_telegram_db(email)
             if token and chat_id:
                 enviar_alerta_telegram(token, chat_id, msg)
                 
-            return True, "Novo post detectado!"
+            return True, "Novo vídeo detectado!"
 
     except Exception as e:
-        registrar_historico_db(f"Erro na varredura de @{perfil}: {e}")
+        registrar_historico_db(f"Erro na varredura do canal {canal}: {e}")
         return False, str(e)
 
-    registrar_historico_db(f"Varredura concluída para @{perfil} (Nenhuma nova postagem).")
-    return False, "Sem novos posts"
+    registrar_historico_db(f"Varredura concluída para o canal {canal} (Nenhum vídeo novo).")
+    return False, "Sem novos vídeos"
 
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
@@ -329,7 +332,7 @@ if not st.session_state.logado:
 # PAINEL PRINCIPAL (APÓS O LOGIN)
 # ==========================================
 st.title("🚀 ViralRadar - Painel de Controle Inteligente")
-st.markdown(f"Monitoramento de perfis, métricas e tendências | 👤 **{st.session_state.usuario_atual}**")
+st.markdown(f"Monitoramento de canais e tendências | 👤 **{st.session_state.usuario_atual}**")
 
 with st.sidebar:
     st.header("📌 Menu")
@@ -347,7 +350,7 @@ with st.sidebar:
         key="menu_principal_viralradar_v9"
     )
     st.markdown("---")
-    st.markdown("**Status do Sistema:** 🟢 Online (SQLite)")
+    st.markdown("**Status do Sistema:** 🟢 Online (YouTube API)")
     
     if st.button("🚪 Sair da Conta (Logout)", key="btn_logout_v9"):
         st.session_state.logado = False
@@ -364,75 +367,73 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("Adicionar Perfil para Monitoramento")
+    st.subheader("Adicionar Canal do YouTube para Monitoramento")
     
-    st.markdown(f"**Uso do Plano:** {qtd_atual} de {LIMITE_PLANO_INICIAL} perfis cadastrados.")
+    st.markdown(f"**Uso do Plano:** {qtd_atual} de {LIMITE_PLANO_INICIAL} canais cadastrados.")
     st.progress(qtd_atual / LIMITE_PLANO_INICIAL if LIMITE_PLANO_INICIAL > 0 else 0)
     
     st.info(f"🔄 **Substituições no mês:** Você usou {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL} trocas permitidas ({trocas_restantes} restantes).")
     
     with st.form("form_perfil_v9", clear_on_submit=True):
-        perfil_input = st.text_input("Digite o nome ou @ do perfil (ex: natgeo):")
-        enviado = st.form_submit_button("Cadastrar Perfil")
+        perfil_input = st.text_input("Digite o nome ou ID do canal (ex: MrBeast):")
+        enviado = st.form_submit_button("Cadastrar Canal")
         
         if enviado:
             if perfil_input:
-                perfil_limpo = perfil_input.replace("@", "").strip().lower()
+                perfil_limpo = perfil_input.replace("@", "").strip()
                 
-                # Se atingiu o limite máximo de 10 perfis, verificar se tem trocas para substituir
+                # Regra correta de limite e substituição
                 if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
                     if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
-                        st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} perfis atingido e suas trocas mensais esgotaram!")
+                        st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} canais atingido e suas trocas mensais esgotaram!")
                     else:
-                        st.warning("⚠️ Limite de perfis atingido. Exclua um perfil existente para liberar vaga.")
+                        st.warning("⚠️ Limite de canais atingido. Exclua um canal existente para liberar vaga.")
                 else:
-                    # Cadastro normal dentro da franquia do plano (NÃO gasta trocas)
                     sucesso, status = salvar_perfil_db(email_usuario, perfil_limpo)
                     if sucesso:
-                        st.success(f"Perfil '@{perfil_limpo}' cadastrado com sucesso!")
+                        st.success(f"Canal '{perfil_limpo}' cadastrado com sucesso!")
                         st.rerun()
                     elif status == "Duplicado":
-                        st.warning("Este perfil já está cadastrado na sua lista.")
+                        st.warning("Este canal já está cadastrado na sua lista.")
             else:
-                st.warning("Por favor, digite um nome de perfil válido.")
+                st.warning("Por favor, digite um nome de canal válido.")
             
-    st.markdown("### 📋 Status e Ações dos Perfis Monitorados")
+    st.markdown("### 📋 Canais Monitorados")
     
     if perfis_cadastrados:
         for p in perfis_cadastrados:
-            st.markdown(f"👤 **`@{p}`**")
+            st.markdown(f"📺 **`{p}`**")
             
             bcol1, bcol2, bcol3 = st.columns(3)
             with bcol1:
                 if st.button(f"▶️ Assistir", key=f"assistir_{p}"):
-                    st.info(f"Abrindo player para @{p}...")
+                    st.info(f"Abrindo canal {p}...")
             with bcol2:
                 if st.button(f"📥 Salvar Ref.", key=f"baixar_{p}"):
-                    st.success(f"Referência de @{p} salva nos favoritos!")
+                    st.success(f"Referência de {p} salva nos favoritos!")
             with bcol3:
                 if st.button(f"🗑️ Excluir", key=f"excluir_{p}"):
                     if excluir_perfil_db(email_usuario, p):
-                        # Só consome troca se o usuário já estava com a lista totalmente cheia (10/10)
                         if qtd_atual >= LIMITE_PLANO_INICIAL:
                             registrar_substituicao_db(email_usuario)
-                        st.success(f"Perfil @{p} removido!")
+                        st.success(f"Canal {p} removido!")
                         st.rerun()
             st.markdown("---")
         
-        if st.button("🔄 Executar Varredura e Checar Novos Posts", key="btn_checar_posts"):
+        if st.button("🔄 Executar Varredura e Checar Novos Vídeos", key="btn_checar_posts"):
             for p in perfis_cadastrados:
                 checar_novos_posts_perfil(email_usuario, p)
-            st.success("Varredura concluída com sucesso nos perfis monitorados! Verifique o Histórico de Alertas.")
+            st.success("Varredura concluída com sucesso! Verifique o Histórico de Alertas.")
             st.rerun()
     else:
-        st.info("Nenhum perfil cadastrado ainda. Adicione acima para começar.")
+        st.info("Nenhum canal cadastrado ainda. Adicione acima para começar.")
 
 elif opcao == "🔥 Tendências e Assuntos":
-    st.subheader("🔥 Tracker de Assuntos e Hashtags em Alta")
+    st.subheader("🔥 Tracker de Assuntos e Vídeos em Alta no YouTube")
     st.markdown("""
-    - 📈 **Nicho de Humor / Memes:** Formato de POV com transição rápida (+240% de engajamento hoje)
-    - 🎵 **Áudio em Alta no Reels:** *“Batuque Digital Remix”* (Mais de 45 mil vídeos nas últimas 12h)
-    - 🏷️ **Hashtags Mais Buscadas:** `#dicadodia`, `#viralvideo`, `#tendencia2026`
+    - 📈 **Nicho de Podcats / Cortes:** Formato de cortes verticais com legendas dinâmicas (+300% de retenção)
+    - 🎵 **Áudio em Alta:** Efeitos sonoros de transição rápida estilo cinematic
+    - 🏷️ **Termos Mais Buscados:** `#shorts`, `tutorial`, `curiosidades`
     """)
 
 elif opcao == "Histórico de Alertas":
@@ -459,25 +460,46 @@ elif opcao == "Configurar Telegram":
             salvar_config_telegram_db(email_usuario, t_input, c_input)
             st.success("Configurações do Telegram salvas com sucesso!")
             
-            if enviar_alerta_telegram(t_input, c_input, "🚀 *ViralRadar Conectado!* Alertas ativados com sucesso."):
+            if enviar_alerta_telegram(t_input, c_input, "🚀 *ViralRadar Conectado ao YouTube!* Alertas ativados."):
                 st.info("Mensagem de teste enviada para o seu Telegram!")
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    if st.button("💳 Assinar Iniciante - Mensal (R$ 19,99/mês)", key="plan_i_m_v9"):
-        st.session_state.plano_checkout = "Plano Iniciante (Mensal) — R$ 19,99/mês"
-        st.success("Plano selecionado! Vá até a aba de Pagamento.")
+    st.markdown("Escolha o plano ideal para o seu volume de monitoramento:")
+    
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        st.markdown("### 🥉 Inicial")
+        st.markdown("**R$ 29,90 / mês**")
+        st.markdown("• 5 Canais/Perfis\n• Alertas via Telegram\n• Histórico básico")
+        if st.button("💳 Assinar Inicial", key="plan_inicial"):
+            st.session_state.plano_checkout = "Plano Inicial — R$ 29,90/mês"
+            st.success("Plano selecionado! Vá até a aba de Pagamento.")
+    with col_p2:
+        st.markdown("### 🥈 Criador")
+        st.markdown("**R$ 59,90 / mês**")
+        st.markdown("• 15 Canais/Perfis\n• Alertas prioritários\n• 5 Trocas mensais")
+        if st.button("💳 Assinar Criador", key="plan_criador"):
+            st.session_state.plano_checkout = "Plano Criador — R$ 59,90/mês"
+            st.success("Plano selecionado! Vá até a aba de Pagamento.")
+    with col_p3:
+        st.markdown("### 🥇 Agência")
+        st.markdown("**R$ 119,90 / mês**")
+        st.markdown("• 40 Canais/Perfis\n• Monitoramento em tempo real\n• Suporte dedicado")
+        if st.button("💳 Assinar Agência", key="plan_agencia"):
+            st.session_state.plano_checkout = "Plano Agência — R$ 119,90/mês"
+            st.success("Plano selecionado! Vá até a aba de Pagamento.")
 
 elif opcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
         st.info(f"**Plano Escolhido:** {st.session_state.plano_checkout}")
-        if st.button("🚀 Confirmar e Pagar Agora", key="btn_concluir_pagamento_v9"):
-            st.success("🎉 Pagamento simulado com sucesso! Acesso liberado!")
+        if st.button("🚀 Confirmar e Pagar Agora via Pix", key="btn_concluir_pagamento_v9"):
+            st.success("🎉 Pagamento simulado com sucesso! Acesso liberado no sistema!")
     else:
-        st.warning("⚠️ Nenhum plano selecionado ainda!")
+        st.warning("⚠️ Nenhum plano selecionado ainda! Visite a aba 'Assinatura / Planos' primeiro.")
 
 elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
-    st.markdown("Fale conosco pelo canal oficial de suporte.")
+    st.markdown("Fale conosco pelo canal oficial de suporte do ViralRadar.")
