@@ -1,6 +1,7 @@
 import streamlit as st
 import os
-import sqlite3
+import psycopg2
+from psycopg2 import IntegrityError
 import hashlib
 import requests
 import json
@@ -12,203 +13,143 @@ from openpyxl.chart.label import DataLabelList
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-# Nome do Banco de Dados SQLite
-DB_NAME = "viralradar.db"
+# ViralRadar 3.3 — Banco persistente Supabase PostgreSQL
 LIMITE_PLANO_INICIAL = 10
 LIMITE_TROCAS_MENSAL = 5
 
-# ==========================================
-# CONFIGURAÇÃO DO BANCO DE DADOS (SQLite)
-# ==========================================
-def inicializar_banco():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Tabela de Usuários (com senha em hash)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS usuarios (
-            email TEXT PRIMARY KEY,
-            senha TEXT NOT NULL
-        )
-    ''')
-    
-    # Tabela de Canais / Perfis Monitorados por Usuário
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS perfis (
-            email TEXT,
-            perfil TEXT,
-            ultimo_post_id TEXT,
-            PRIMARY KEY (email, perfil)
-        )
-    ''')
-    
-    # Garante que a coluna 'ultimo_post_id' exista em bancos criados anteriormente
-    cursor.execute("PRAGMA table_info(perfis)")
-    colunas = [coluna[1] for coluna in cursor.fetchall()]
-    if 'ultimo_post_id' not in colunas:
-        cursor.execute("ALTER TABLE perfis ADD COLUMN ultimo_post_id TEXT")
-    
-    # Tabela de Métricas / Substituições por Usuário (Garante 0 inicial)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS metricas (
-            email TEXT PRIMARY KEY,
-            trocas INTEGER DEFAULT 0
-        )
-    ''')
-    
-    # Tabela de Histórico de Alertas
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS historico (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            mensagem TEXT,
-            data TEXT
-        )
-    ''')
-    
-    # Tabela de Configurações do Telegram por Usuário
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS configuracoes (
-            email TEXT PRIMARY KEY,
-            telegram_token TEXT,
-            telegram_chat_id TEXT
-        )
-    ''')
-    
-    cursor.execute("""CREATE TABLE IF NOT EXISTS video_metricas (
-        email TEXT NOT NULL, canal_id TEXT NOT NULL, video_id TEXT NOT NULL,
-        visualizacoes INTEGER, curtidas INTEGER, comentarios INTEGER,
-        coletado_em TEXT NOT NULL,
-        PRIMARY KEY(email, canal_id, video_id, coletado_em)
-    )""")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS snapshots_perfil (
-        email TEXT NOT NULL, perfil TEXT NOT NULL, painel_json TEXT NOT NULL,
-        atualizado_em TEXT NOT NULL, novo INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(email, perfil)
-    )""")
-    conn.commit()
-    conn.close()
 
-# Inicializa o banco ao iniciar o app
-inicializar_banco()
+def conectar_banco():
+    """Abre conexão de curta duração usando somente Streamlit Secrets."""
+    cfg = st.secrets["connections"]["supabase"]
+    return psycopg2.connect(
+        host=cfg["host"], port=int(cfg["port"]), dbname=cfg["database"],
+        user=cfg["user"], password=cfg["password"],
+        sslmode=cfg.get("sslmode", "require"), connect_timeout=12,
+    )
 
-# Função para gerar Hash SHA-256 da senha
+
 def criar_hash_senha(senha):
-    return hashlib.sha256(senha.encode('utf-8')).hexdigest()
+    """PBKDF2 com salt aleatório; também aceitamos hashes legados no login."""
+    import secrets
+    salt = secrets.token_bytes(16)
+    chave = hashlib.pbkdf2_hmac("sha256", senha.encode(), salt, 600_000)
+    return f"pbkdf2_sha256$600000${salt.hex()}${chave.hex()}"
 
-# ==========================================
-# FUNÇÕES DE MANIPULAÇÃO DE DADOS
-# ==========================================
+
+def conferir_senha(senha, armazenada):
+    import hmac
+    if armazenada.startswith("pbkdf2_sha256$"):
+        try:
+            _, ciclos, salt, chave = armazenada.split("$", 3)
+            calculada = hashlib.pbkdf2_hmac("sha256", senha.encode(), bytes.fromhex(salt), int(ciclos))
+            return hmac.compare_digest(calculada, bytes.fromhex(chave))
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(hashlib.sha256(senha.encode()).hexdigest(), armazenada)
+
+
 def cadastrar_usuario_db(email, senha):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    email = email.strip().lower()
     try:
-        senha_hash = criar_hash_senha(senha)
-        cursor.execute("INSERT INTO usuarios (email, senha) VALUES (?, ?)", (email, senha_hash))
-        cursor.execute("INSERT OR REPLACE INTO metricas (email, trocas) VALUES (?, 0)", (email,))
-        conn.commit()
-        conn.close()
+        with conectar_banco() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO usuarios (email, senha) VALUES (%s, %s)",
+                            (email, criar_hash_senha(senha)))
+                cur.execute("INSERT INTO metricas (email, trocas) VALUES (%s, 0)", (email,))
         return True, "Cadastro realizado com sucesso!"
-    except sqlite3.IntegrityError:
-        conn.close()
+    except IntegrityError:
         return False, "E-mail já cadastrado!"
 
+
 def verificar_login_db(email, senha):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    senha_hash = criar_hash_senha(senha)
-    cursor.execute("SELECT * FROM usuarios WHERE email = ? AND senha = ?", (email, senha_hash))
-    usuario = cursor.fetchone()
-    conn.close()
-    return usuario is not None
+    email = email.strip().lower()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT senha FROM usuarios WHERE email=%s", (email,))
+            linha = cur.fetchone()
+            if not linha or not conferir_senha(senha, linha[0]):
+                return False
+            if not linha[0].startswith("pbkdf2_sha256$"):
+                cur.execute("UPDATE usuarios SET senha=%s WHERE email=%s", (criar_hash_senha(senha), email))
+            return True
+
 
 def ler_perfis_db(email):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT perfil FROM perfis WHERE email = ?", (email,))
-    resultados = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return resultados
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT perfil FROM perfis WHERE email=%s ORDER BY perfil", (email,))
+            return [linha[0] for linha in cur.fetchall()]
+
 
 def salvar_perfil_db(email, novo_perfil):
-    perfis = ler_perfis_db(email)
-    if len(perfis) >= LIMITE_PLANO_INICIAL:
-        return False, "Limite atingido"
-    
-    if novo_perfil not in perfis:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO perfis (email, perfil, ultimo_post_id) VALUES (?, ?, ?)", (email, novo_perfil, "nenhum"))
-        conn.commit()
-        conn.close()
-        return True, "Sucesso"
-    return False, "Duplicado"
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM perfis WHERE email=%s", (email,))
+            if cur.fetchone()[0] >= LIMITE_PLANO_INICIAL:
+                return False, "Limite atingido"
+            cur.execute("INSERT INTO perfis (email, perfil, ultimo_post_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING perfil",
+                        (email, novo_perfil, "nenhum"))
+            return (True, "Sucesso") if cur.fetchone() else (False, "Duplicado")
+
 
 def excluir_perfil_db(email, perfil_alvo):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM perfis WHERE email = ? AND perfil = ?", (email, perfil_alvo))
-    conn.execute("DELETE FROM snapshots_perfil WHERE email=? AND perfil=?", (email, perfil_alvo))
-    conn.commit()
-    conn.close()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM snapshots_perfil WHERE email=%s AND perfil=%s", (email, perfil_alvo))
+            cur.execute("DELETE FROM perfis WHERE email=%s AND perfil=%s", (email, perfil_alvo))
     return True
 
+
 def ler_trocas_db(email):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT trocas FROM metricas WHERE email = ?", (email,))
-    res = cursor.fetchone()
-    if res is None:
-        cursor.execute("INSERT OR IGNORE INTO metricas (email, trocas) VALUES (?, 0)", (email,))
-        conn.commit()
-        conn.close()
-        return 0
-    conn.close()
-    return res[0]
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO metricas (email,trocas) VALUES (%s,0) ON CONFLICT (email) DO NOTHING", (email,))
+            cur.execute("SELECT trocas FROM metricas WHERE email=%s", (email,))
+            return cur.fetchone()[0]
+
 
 def salvar_troca_db(email, qtd):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO metricas (email, trocas) VALUES (?, ?)", (email, qtd))
-    conn.commit()
-    conn.close()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO metricas (email,trocas) VALUES (%s,%s) ON CONFLICT (email) DO UPDATE SET trocas=EXCLUDED.trocas", (email, qtd))
+
 
 def registrar_substituicao_db(email):
-    trocas_feitas = ler_trocas_db(email)
-    if trocas_feitas < LIMITE_TROCAS_MENSAL:
-        salvar_troca_db(email, trocas_feitas + 1)
-        return True
-    return False
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE metricas SET trocas=trocas+1 WHERE email=%s AND trocas < %s RETURNING trocas", (email, LIMITE_TROCAS_MENSAL))
+            return cur.fetchone() is not None
 
-def registrar_historico_db(mensagem):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    data_atual = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    cursor.execute("INSERT INTO historico (mensagem, data) VALUES (?, ?)", (mensagem, data_atual))
-    conn.commit()
-    conn.close()
 
-def ler_historico_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT data, mensagem FROM historico ORDER BY id DESC")
-    resultados = [f"{row[0]} — {row[1]}" for row in cursor.fetchall()]
-    conn.close()
-    return resultados
+def registrar_historico_db(mensagem, email=None):
+    if not email:
+        return
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO historico (email,mensagem,data) VALUES (%s,%s,%s)",
+                        (email, mensagem, datetime.now().strftime("%d/%m/%Y %H:%M:%S")))
+
+
+def ler_historico_db(email):
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT data,mensagem FROM historico WHERE email=%s ORDER BY id DESC LIMIT 200", (email,))
+            return [f"{data} — {mensagem}" for data, mensagem in cur.fetchall()]
+
 
 def salvar_config_telegram_db(email, chat_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO configuracoes (email, telegram_token, telegram_chat_id) VALUES (?, ?, ?)", (email, "", chat_id))
-    conn.commit()
-    conn.close()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO configuracoes (email,telegram_token,telegram_chat_id)
+                VALUES (%s,%s,%s) ON CONFLICT (email) DO UPDATE SET telegram_chat_id=EXCLUDED.telegram_chat_id""",
+                (email, "", chat_id))
+
 
 def ler_config_telegram_db(email):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_token, telegram_chat_id FROM configuracoes WHERE email = ?", (email,))
-    res = cursor.fetchone()
-    conn.close()
-    return res if res else ("", "")
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_token,telegram_chat_id FROM configuracoes WHERE email=%s", (email,))
+            return cur.fetchone() or ("", "")
 
 
 def credenciais_telegram_usuario(email):
@@ -314,51 +255,49 @@ def checar_novos_posts_perfil(email, canal):
             })
 
         coletado_em = datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(DB_NAME) as conn:
-            linha = conn.execute(
-                "SELECT ultimo_post_id FROM perfis WHERE email=? AND perfil=?",
-                (email, canal)
-            ).fetchone()
-            if linha is None:
-                return False, "Canal não cadastrado.", None
-            anterior = linha[0]
-            # Guarda a medição anterior antes de registrar a nova.
-            for video in videos:
-                antiga = conn.execute("""SELECT visualizacoes FROM video_metricas
-                    WHERE email=? AND canal_id=? AND video_id=?
-                    ORDER BY coletado_em DESC LIMIT 1""",
-                    (email, canal_id, video["id"])).fetchone()
-                video["delta_views"] = (video["visualizacoes"] - antiga[0]
-                    if antiga and antiga[0] is not None and video["visualizacoes"] is not None else None)
-                conn.execute("""INSERT INTO video_metricas
-                    (email, canal_id, video_id, visualizacoes, curtidas, comentarios, coletado_em)
-                    VALUES (?,?,?,?,?,?,?)""", (email, canal_id, video["id"],
-                    video["visualizacoes"], video["curtidas"], video["comentarios"], coletado_em))
-
-            mais_recente = ids[0]
-            primeira = not anterior or anterior == "nenhum" or anterior.startswith("yt_video_")
-            novos = [] if primeira or anterior == mais_recente or anterior not in ids else ids[:ids.index(anterior)]
-            if primeira or anterior not in ids:
-                conn.execute("UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
-                             (mais_recente, email, canal))
-                mensagem = f"{nome}: referência sincronizada; exibindo os últimos 5 vídeos."
-            elif novos:
-                token, chat_id = credenciais_telegram_usuario(email)
-                falha = False
-                for video_id in reversed(novos):
-                    aviso = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\nhttps://www.youtube.com/watch?v={video_id}"
-                    if token and chat_id and not enviar_alerta_telegram(token, chat_id, aviso):
-                        falha = True
-                        break
-                if not falha:
-                    conn.execute("UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
-                                 (mais_recente, email, canal))
-                mensagem = (f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s)." if not falha
-                            else f"{nome}: falha ao enviar Telegram; tentativa será repetida.")
-            else:
-                mensagem = f"{nome}: sem vídeos novos; métricas atualizadas."
+        with conectar_banco() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ultimo_post_id FROM perfis WHERE email=%s AND perfil=%s", (email, canal))
+                linha = cur.fetchone()
+                if linha is None:
+                    return False, "Canal não cadastrado.", None
+                anterior = linha[0]
+                for video in videos:
+                    cur.execute("""SELECT visualizacoes FROM video_metricas
+                        WHERE email=%s AND canal_id=%s AND video_id=%s
+                        ORDER BY coletado_em DESC LIMIT 1""", (email, canal_id, video["id"]))
+                    antiga = cur.fetchone()
+                    video["delta_views"] = (video["visualizacoes"] - antiga[0]
+                        if antiga and antiga[0] is not None and video["visualizacoes"] is not None else None)
+                    cur.execute("""INSERT INTO video_metricas
+                        (email, canal_id, video_id, visualizacoes, curtidas, comentarios, coletado_em)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                        (email, canal_id, video["id"], video["visualizacoes"],
+                         video["curtidas"], video["comentarios"], coletado_em))
+                mais_recente = ids[0]
+                primeira = not anterior or anterior == "nenhum" or anterior.startswith("yt_video_")
+                novos = [] if primeira or anterior == mais_recente or anterior not in ids else ids[:ids.index(anterior)]
+                if primeira or anterior not in ids:
+                    cur.execute("UPDATE perfis SET ultimo_post_id=%s WHERE email=%s AND perfil=%s",
+                                (mais_recente, email, canal))
+                    mensagem = f"{nome}: referência sincronizada; exibindo os últimos 5 vídeos."
+                elif novos:
+                    token, chat_id = credenciais_telegram_usuario(email)
+                    falha = False
+                    for video_id in reversed(novos):
+                        aviso = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\nhttps://www.youtube.com/watch?v={video_id}"
+                        if token and chat_id and not enviar_alerta_telegram(token, chat_id, aviso):
+                            falha = True
+                            break
+                    if not falha:
+                        cur.execute("UPDATE perfis SET ultimo_post_id=%s WHERE email=%s AND perfil=%s",
+                                    (mais_recente, email, canal))
+                    mensagem = (f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s)." if not falha
+                                else f"{nome}: falha ao enviar Telegram; tentativa será repetida.")
+                else:
+                    mensagem = f"{nome}: sem vídeos novos; métricas atualizadas."
         return bool(novos), mensagem, {"nome": nome, "videos": videos, "coletado_em": coletado_em}
-    except (requests.RequestException, ValueError, KeyError, sqlite3.Error) as erro:
+    except (requests.RequestException, ValueError, KeyError, psycopg2.Error) as erro:
         return False, f"Erro ao consultar {canal}: {erro}", None
 
 
@@ -392,22 +331,25 @@ def mostrar_resultados_youtube(painel):
 def salvar_snapshot(email, perfil, painel, novo):
     if painel is None:
         return
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("""INSERT INTO snapshots_perfil
-            (email, perfil, painel_json, atualizado_em, novo)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(email, perfil) DO UPDATE SET
-            painel_json=excluded.painel_json,
-            atualizado_em=excluded.atualizado_em,
-            novo=excluded.novo""",
-            (email, perfil, json.dumps(painel, ensure_ascii=False),
-             painel.get("coletado_em", datetime.now(timezone.utc).isoformat()), int(novo)))
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO snapshots_perfil
+                (email, perfil, painel_json, atualizado_em, novo)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT(email, perfil) DO UPDATE SET
+                painel_json=EXCLUDED.painel_json,
+                atualizado_em=EXCLUDED.atualizado_em,
+                novo=EXCLUDED.novo""",
+                (email, perfil, json.dumps(painel, ensure_ascii=False),
+                 painel.get("coletado_em", datetime.now(timezone.utc).isoformat()), int(novo)))
 
 
 def ler_snapshots(email):
-    with sqlite3.connect(DB_NAME) as conn:
-        registros = conn.execute("""SELECT perfil, painel_json, atualizado_em, novo
-            FROM snapshots_perfil WHERE email=?""", (email,)).fetchall()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT perfil, painel_json, atualizado_em, novo
+                FROM snapshots_perfil WHERE email=%s""", (email,))
+            registros = cur.fetchall()
     return {p: {"painel": json.loads(j), "atualizado": t, "novo": bool(n)}
             for p, j, t, n in registros}
 
@@ -449,14 +391,14 @@ def ler_evolucao_db(email, perfis, snapshots=None):
     """Histórico REAL das medições armazenadas; não inventa crescimento."""
     if not perfis:
         return []
-    with sqlite3.connect(DB_NAME) as conn:
-        dados = conn.execute("""SELECT vm.canal_id, vm.video_id, vm.coletado_em,
-                              vm.visualizacoes, vm.curtidas, vm.comentarios
-                              FROM video_metricas vm WHERE vm.email=?
-                              ORDER BY vm.video_id, vm.coletado_em""", (email,)).fetchall()
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT vm.canal_id, vm.video_id, vm.coletado_em,
+                vm.visualizacoes, vm.curtidas, vm.comentarios
+                FROM video_metricas vm WHERE vm.email=%s
+                ORDER BY vm.video_id, vm.coletado_em""", (email,))
+            dados = cur.fetchall()
     if snapshots is not None:
-        # Filtra o histórico pelos vídeos pertencentes aos canais escolhidos.
-        # Cada vídeo tem um ID exclusivo no YouTube.
         ids = {video.get("id") for perfil in perfis
                for video in (snapshots.get(perfil, {}).get("painel") or {}).get("videos", [])}
         dados = [registro for registro in dados if registro[1] in ids]
@@ -686,7 +628,7 @@ if not st.session_state.logado:
             if btn_entrar:
                 if verificar_login_db(email_login, senha_login):
                     st.session_state.logado = True
-                    st.session_state.usuario_atual = email_login
+                    st.session_state.usuario_atual = email_login.strip().lower()
                     st.success("Login efetuado com sucesso! Entrando...")
                     st.rerun()
                 else:
@@ -704,7 +646,7 @@ if not st.session_state.logado:
                     sucesso, msg = cadastrar_usuario_db(email_cad, senha_cad)
                     if sucesso:
                         st.session_state.logado = True
-                        st.session_state.usuario_atual = email_cad
+                        st.session_state.usuario_atual = email_cad.strip().lower()
                         st.success(f"🎉 {msg} Seja bem-vindo!")
                         st.rerun()
                     else:
@@ -753,7 +695,7 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("📡 ViralRadar 3.2 — Central multirredes")
+    st.subheader("📡 ViralRadar 3.3 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
     st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
 
@@ -886,7 +828,7 @@ elif opcao == "🔥 Tendências e Assuntos":
 
 elif opcao == "Histórico de Alertas":
     st.subheader("🔔 Histórico de Disparos Recentes")
-    historico = ler_historico_db()
+    historico = ler_historico_db(email_usuario)
     if historico:
         for item in historico:
             st.text(f"📢 {item}")
@@ -919,9 +861,7 @@ elif opcao == "Configurar Telegram":
             st.success("Mensagem enviada! Confira a conversa com seu bot no Telegram.")
         else:
             st.error("Não foi possível enviar. Confira o Chat ID e se você iniciou a conversa com /start.")
-    st.info("Nesta versão, o Chat ID é salvo no SQLite do Streamlit Cloud. "
-            "Ele pode desaparecer após reinicializações. Antes de vender assinaturas, "
-            "vamos migrar os cadastros para um banco persistente.")
+    st.info("O Chat ID é salvo no Supabase PostgreSQL, fora do servidor do Streamlit.")
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
