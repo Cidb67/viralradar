@@ -1,0 +1,20 @@
+
+name: ViralRadar - Monitoramento Automatico
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitoramento:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Confirmar funcionamento
+        run: |
+          echo "ViralRadar 3.4 - Agendador funcionando!"
+          date -u
