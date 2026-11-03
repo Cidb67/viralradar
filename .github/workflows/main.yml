@@ -9,12 +9,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: viralradar-monitoramento
+  cancel-in-progress: false
+
 jobs:
   monitoramento:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Confirmar funcionamento
-        run: |
-          echo "ViralRadar 3.4 - Agendador funcionando!"
-          date -u
+      - name: Baixar arquivos do ViralRadar
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install requests psycopg2-binary
+
+      - name: Executar monitoramento automatico
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python viralradar_monitor.py
