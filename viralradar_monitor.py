@@ -1,4 +1,4 @@
-"""ViralRadar 3.4 — monitoramento agendado, sem dependência do Streamlit.
+"""ViralRadar 3.5 — monitoramento agendado, sem dependência do Streamlit.
 Executar via GitHub Actions. Segredos exclusivamente em variáveis de ambiente.
 """
 import json
@@ -74,7 +74,7 @@ def monitorar(email, perfil):
     ids = [x for x in ids if x]
     if not ids:
         print(f'{nome}: nenhum vídeo encontrado')
-        return
+        return 0
     detalhes = youtube('videos', part='snippet,statistics', id=','.join(ids[:5])).get('items', [])
     por_id = {v['id']: v for v in detalhes}
     videos = []
@@ -85,7 +85,7 @@ def monitorar(email, perfil):
             cur.execute('SELECT ultimo_post_id FROM perfis WHERE email=%s AND perfil=%s FOR UPDATE', (email, perfil))
             registro = cur.fetchone()
             if not registro:
-                return
+                return 0
             anterior = registro[0]
             cur.execute('SELECT telegram_chat_id FROM configuracoes WHERE email=%s', (email,))
             chat = cur.fetchone()
@@ -117,6 +117,7 @@ def monitorar(email, perfil):
                     (email, canal_id, vid, views, likes, comments, coleta))
             mais_recente = ids[0]
             primeira = not anterior or anterior == 'nenhum' or anterior.startswith('yt_video_')
+            novos = []
             if primeira or anterior not in ids:
                 # Primeira leitura é referência, não dispara alertas antigos.
                 cur.execute('UPDATE perfis SET ultimo_post_id=%s WHERE email=%s AND perfil=%s',
@@ -145,6 +146,25 @@ def monitorar(email, perfil):
                 painel_json=EXCLUDED.painel_json, atualizado_em=EXCLUDED.atualizado_em,
                 novo=EXCLUDED.novo''',
                 (email, perfil, json.dumps(painel, ensure_ascii=False), coleta, int(bool(novos))))
+    return len(novos)
+
+
+def iniciar_execucao(email):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''INSERT INTO monitoramento_execucoes (email, status)
+                VALUES (%s, 'em_andamento') RETURNING id''', (email,))
+            return cur.fetchone()[0]
+
+
+def finalizar_execucao(execucao_id, canais, videos, erros):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''UPDATE monitoramento_execucoes SET
+                finalizado_em = NOW(), status = %s, canais_consultados = %s,
+                videos_detectados = %s, erros = %s
+                WHERE id = %s''',
+                ('falha' if erros else 'sucesso', canais, videos, erros, execucao_id))
 
 
 def main():
@@ -153,16 +173,39 @@ def main():
             cur.execute('SELECT email, perfil FROM perfis ORDER BY email, perfil')
             perfis = cur.fetchall()
     print(f'ViralRadar: {len(perfis)} canais para consultar')
-    erros = 0
+    por_usuario = {}
     for email, perfil in perfis:
+        por_usuario.setdefault(email, []).append(perfil)
+
+    erros_totais = 0
+    for email, canais in por_usuario.items():
+        # O registro é individual por usuário, sem misturar canais de contas distintas.
+        execucao_id = iniciar_execucao(email)
+        consultados = 0
+        detectados = 0
+        erros = 0
         try:
-            monitorar(email, perfil)
-        except (requests.RequestException, psycopg2.Error, ValueError, KeyError, RuntimeError) as exc:
-            # Evita imprimir exceções HTTP com URLs contendo chaves de API.
-            print(f'Erro ao consultar canal {perfil}: {type(exc).__name__}')
+            for perfil in canais:
+                consultados += 1
+                try:
+                    detectados += monitorar(email, perfil)
+                except (requests.RequestException, psycopg2.Error, ValueError, KeyError,
+                        RuntimeError, TypeError, IndexError) as exc:
+                    # Não registrar detalhes de exceções HTTP que possam conter a chave.
+                    print(f'Erro ao consultar canal {perfil}: {type(exc).__name__}')
+                    erros += 1
+        except Exception:
             erros += 1
-    if erros:
-        print(f'Execução encerrada com {erros} erro(s)')
+            raise
+        finally:
+            # Mesmo com erros de consulta, registrar o resultado no Supabase.
+            finalizar_execucao(execucao_id, consultados, detectados, erros)
+        erros_totais += erros
+        print(f'Usuário processado: {consultados} canal(is), '
+              f'{detectados} vídeo(s) detectado(s), {erros} erro(s)')
+
+    if erros_totais:
+        print(f'Execução encerrada com {erros_totais} erro(s)')
         sys.exit(1)
     print('Execução concluída')
 
