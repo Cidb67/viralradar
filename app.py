@@ -11,9 +11,30 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.label import DataLabelList
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
-# ViralRadar 3.3 — Banco persistente Supabase PostgreSQL
+# ViralRadar 3.3.1 — Banco persistente Supabase PostgreSQL e horários de Brasília
+FUSO_BRASIL = ZoneInfo("America/Sao_Paulo")
+
+def horario_brasilia(valor):
+    """Converte ISO 8601 ou datetime em UTC para horário de São Paulo.
+    Datetimes sem fuso são interpretados como UTC (padrão dos registros existentes).
+    """
+    if not valor:
+        return None
+    try:
+        dt = valor if isinstance(valor, datetime) else datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(FUSO_BRASIL)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+def exibir_horario_br(valor):
+    dt = horario_brasilia(valor)
+    return dt.strftime("%d/%m/%Y às %H:%M") if dt else "Não informado"
+
 LIMITE_PLANO_INICIAL = 10
 LIMITE_TROCAS_MENSAL = 5
 
@@ -127,7 +148,7 @@ def registrar_historico_db(mensagem, email=None):
     with conectar_banco() as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO historico (email,mensagem,data) VALUES (%s,%s,%s)",
-                        (email, mensagem, datetime.now().strftime("%d/%m/%Y %H:%M:%S")))
+                        (email, mensagem, datetime.now(FUSO_BRASIL).strftime("%d/%m/%Y %H:%M:%S")))
 
 
 def ler_historico_db(email):
@@ -305,7 +326,7 @@ def mostrar_resultados_youtube(painel):
     if not painel:
         return
     st.markdown(f"#### {painel['nome']} — últimos 5 vídeos")
-    st.caption(f"Consulta em UTC: {painel['coletado_em'][:19].replace('T', ' ')}")
+    st.caption(f"Consulta (Brasília): {exibir_horario_br(painel.get('coletado_em'))}")
     for video in painel["videos"]:
         with st.container(border=True):
             col_img, col_info = st.columns([1, 3])
@@ -366,25 +387,21 @@ def linhas_relatorio(perfis, snapshots):
                 "Perfil": perfil, "Nome do canal": painel.get("nome", perfil),
                 "Rede": "YouTube", "Posição": pos,
                 "Título": video.get("titulo", ""),
-                "Publicado em (UTC)": video.get("publicado", ""),
+                "Publicado em (Brasília)": video.get("publicado", ""),
                 "Visualizações": video.get("visualizacoes"),
                 "Variação de visualizações": video.get("delta_views"),
                 "Curtidas": video.get("curtidas"),
                 "Comentários": video.get("comentarios"),
                 "Link": video.get("url", ""),
-                "Consultado em (UTC)": dado["atualizado"]
+                "Consultado em (Brasília)": dado["atualizado"]
             })
     return linhas
 
 
 def data_excel(valor):
-    """Converte data ISO do YouTube em datetime sem fuso para o Excel."""
-    if not valor:
-        return None
-    try:
-        return datetime.fromisoformat(str(valor).replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
-    except (ValueError, TypeError):
-        return None
+    """Converte datas UTC para horário de Brasília, sem fuso (exigência do Excel)."""
+    dt = horario_brasilia(valor)
+    return dt.replace(tzinfo=None) if dt else None
 
 
 def ler_evolucao_db(email, perfis, snapshots=None):
@@ -440,8 +457,8 @@ def gerar_excel(linhas, historico=None):
                 ws.cell(row, col).fill = PatternFill("solid", fgColor=claro)
 
     titulo(resumo, "VIRALRADAR | Resumo de monitoramento", 6)
-    resumo["A3"] = "Gerado em (UTC)"
-    resumo["B3"] = datetime.now(timezone.utc).replace(tzinfo=None)
+    resumo["A3"] = "Gerado em (Brasília)"
+    resumo["B3"] = datetime.now(FUSO_BRASIL).replace(tzinfo=None)
     resumo["B3"].number_format = "dd/mm/yyyy hh:mm"
     resumo["A4"] = "Fonte: últimas consultas salvas no ViralRadar; somente YouTube integrado."
     resumo.merge_cells("A4:F4")
@@ -468,9 +485,9 @@ def gerar_excel(linhas, historico=None):
         resumo.column_dimensions[col].width = largura
 
     titulo(publicacoes, "VIRALRADAR | Publicações monitoradas", 12)
-    cabecalho(publicacoes, 3, ["Perfil", "Rede", "Data da publicação (UTC)", "Título", "Visualizações",
+    cabecalho(publicacoes, 3, ["Perfil", "Rede", "Data da publicação (Brasília)", "Título", "Visualizações",
                                "Crescimento (views)", "Crescimento (%)", "Curtidas", "Comentários",
-                               "Link do vídeo", "Última consulta (UTC)", "ID do vídeo"])
+                               "Link do vídeo", "Última consulta (Brasília)", "ID do vídeo"])
     for row, item in enumerate(linhas, 4):
         link = item.get("Link") or ""
         atual = item.get("Visualizações")
@@ -478,9 +495,9 @@ def gerar_excel(linhas, historico=None):
         anterior_views = atual - delta if isinstance(atual, (int, float)) and isinstance(delta, (int, float)) else None
         percentual = delta / anterior_views if anterior_views is not None and anterior_views > 0 else None
         valores = [item.get("Nome do canal") or item.get("Perfil"), item.get("Rede"),
-                   data_excel(item.get("Publicado em (UTC)")), item.get("Título"),
+                   data_excel(item.get("Publicado em (Brasília)")), item.get("Título"),
                    atual, delta, percentual, item.get("Curtidas"), item.get("Comentários"), link,
-                   data_excel(item.get("Consultado em (UTC)")),
+                   data_excel(item.get("Consultado em (Brasília)")),
                    link.split("v=")[-1].split("&")[0] if "v=" in link else ""]
         for col, valor in enumerate(valores, 1):
             cel = publicacoes.cell(row, col, valor)
@@ -502,7 +519,7 @@ def gerar_excel(linhas, historico=None):
     titulo(evolucao, "VIRALRADAR | Histórico de medições", 7)
     evolucao["A2"] = "Cada linha representa uma coleta salva. A evolução só existe após duas ou mais consultas."
     evolucao.merge_cells("A2:G2")
-    cabecalho(evolucao, 4, ["Canal ID", "Vídeo ID", "Consulta (UTC)", "Visualizações", "Curtidas", "Comentários", "Variação de views"])
+    cabecalho(evolucao, 4, ["Canal ID", "Vídeo ID", "Consulta (Brasília)", "Visualizações", "Curtidas", "Comentários", "Variação de views"])
     anterior = {}
     for row, (canal, video, coleta, views, likes, comentarios) in enumerate(historico, 5):
         chave = (canal, video)
@@ -527,7 +544,7 @@ def gerar_excel(linhas, historico=None):
                        key=lambda x: x["Visualizações"], reverse=True)[:20]
     tem_delta = False
     for row, item in enumerate(ordenadas, 6):
-        dt = data_excel(item.get("Publicado em (UTC)"))
+        dt = data_excel(item.get("Publicado em (Brasília)"))
         rotulo = f"{dt.strftime('%d/%m/%Y') if dt else 's/data'} | {str(item.get('Título',''))[:38]}"
         graficos.cell(row, 1, rotulo)
         graficos.cell(row, 2, item["Visualizações"])
@@ -695,7 +712,7 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("📡 ViralRadar 3.3 — Central multirredes")
+    st.subheader("📡 ViralRadar 3.3.1 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
     st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
 
@@ -762,7 +779,7 @@ if opcao == "Painel Principal":
             if dado and dado.get("atualizado"):
                 data_consulta = data_excel(dado["atualizado"])
                 if data_consulta:
-                    colunas[0].caption(f"Última consulta: {data_consulta.strftime('%d/%m/%Y %H:%M')} UTC")
+                    colunas[0].caption(f"Última consulta: {data_consulta.strftime('%d/%m/%Y %H:%M')} (Brasília)")
             else:
                 colunas[0].caption("Ainda não consultado")
             if ultimo:
@@ -774,7 +791,7 @@ if opcao == "Painel Principal":
                 coluna.caption("—")
             with st.expander(f"Detalhes · {nome}"):
                 if dado:
-                    st.caption(f"Última consulta (UTC): {dado['atualizado']} | 🟢 Novidade na última consulta · ⚪ Sem novidade")
+                    st.caption(f"Última consulta (Brasília): {exibir_horario_br(dado['atualizado'])} | 🟢 Novidade na última consulta · ⚪ Sem novidade")
                     mostrar_resultados_youtube(painel)
                 else:
                     st.info("Ainda não consultado. Clique em atualizar todos.")
