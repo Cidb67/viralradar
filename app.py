@@ -3,7 +3,8 @@ import os
 import sqlite3
 import hashlib
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # Nome do Banco de Dados SQLite
 DB_NAME = "viralradar.db"
@@ -67,6 +68,12 @@ def inicializar_banco():
         )
     ''')
     
+    cursor.execute("""CREATE TABLE IF NOT EXISTS video_metricas (
+        email TEXT NOT NULL, canal_id TEXT NOT NULL, video_id TEXT NOT NULL,
+        visualizacoes INTEGER, curtidas INTEGER, comentarios INTEGER,
+        coletado_em TEXT NOT NULL,
+        PRIMARY KEY(email, canal_id, video_id, coletado_em)
+    )""")
     conn.commit()
     conn.close()
 
@@ -249,60 +256,112 @@ def identificar_canal_youtube(entrada):
 
 
 def checar_novos_posts_perfil(email, canal):
-    """Consulta vídeos reais e avisa apenas depois da sincronização inicial."""
+    """Retorna (houve_novidade, mensagem, dados_painel)."""
     try:
         canal_id, nome, uploads = identificar_canal_youtube(canal)
-        dados = consultar_youtube("playlistItems", {
+        pagina = consultar_youtube("playlistItems", {
             "part": "snippet,contentDetails", "playlistId": uploads, "maxResults": 10
         })
-        videos = [
-            item["contentDetails"]["videoId"]
-            for item in dados.get("items", [])
-            if item.get("contentDetails", {}).get("videoId")
-        ]
-        if not videos:
-            return False, f"Nenhum vídeo público encontrado em {nome}."
+        itens = pagina.get("items", [])
+        ids = [i.get("contentDetails", {}).get("videoId") for i in itens]
+        ids = [v for v in ids if v]
+        if not ids:
+            return False, f"{nome}: nenhum vídeo público encontrado.", {"nome": nome, "videos": []}
 
+        # videos.list fornece estatísticas reais dos vídeos disponíveis.
+        detalhes = consultar_youtube("videos", {
+            "part": "snippet,statistics", "id": ",".join(ids[:5]), "maxResults": 5
+        })
+        por_id = {v["id"]: v for v in detalhes.get("items", [])}
+        videos = []
+        for video_id in ids[:5]:
+            dado = por_id.get(video_id)
+            if not dado:
+                continue
+            snippet = dado.get("snippet", {})
+            stats = dado.get("statistics", {})
+            videos.append({
+                "id": video_id,
+                "titulo": snippet.get("title", "Sem título"),
+                "publicado": snippet.get("publishedAt", ""),
+                "imagem": snippet.get("thumbnails", {}).get("medium", {}).get("url"),
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "visualizacoes": int(stats["viewCount"]) if "viewCount" in stats else None,
+                "curtidas": int(stats["likeCount"]) if "likeCount" in stats else None,
+                "comentarios": int(stats["commentCount"]) if "commentCount" in stats else None,
+            })
+
+        coletado_em = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(DB_NAME) as conn:
             linha = conn.execute(
                 "SELECT ultimo_post_id FROM perfis WHERE email=? AND perfil=?",
                 (email, canal)
             ).fetchone()
             if linha is None:
-                return False, "Canal não está cadastrado."
+                return False, "Canal não cadastrado.", None
             anterior = linha[0]
-            mais_recente = videos[0]
-            if not anterior or anterior == "nenhum" or anterior.startswith("yt_video_"):
-                conn.execute(
-                    "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
-                    (mais_recente, email, canal)
-                )
-                return False, f"{nome} sincronizado. Próximas publicações serão verificadas."
-            if anterior == mais_recente:
-                return False, f"{nome}: sem novos vídeos."
-            if anterior not in videos:
-                # Evita falsos alertas quando o vídeo anterior sai da janela consultada.
-                conn.execute(
-                    "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
-                    (mais_recente, email, canal)
-                )
-                return False, f"{nome}: referência antiga fora dos últimos 10; sincronizado sem alerta."
-            novos = videos[:videos.index(anterior)]
-            token, chat_id = ler_config_telegram_db(email)
-            # Não avança a referência se o envio configurado falhar.
-            for video_id in reversed(novos):
-                link = f"https://www.youtube.com/watch?v={video_id}"
-                mensagem = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\n{link}"
-                if token and chat_id and not enviar_alerta_telegram(token, chat_id, mensagem):
-                    return False, f"{nome}: falha no Telegram; referência mantida para nova tentativa."
-            conn.execute(
-                "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
-                (mais_recente, email, canal)
-            )
-        registrar_historico_db(f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s).")
-        return True, f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s)."
-    except (requests.RequestException, ValueError, KeyError) as erro:
-        return False, f"Erro ao consultar {canal}: {erro}"
+            # Guarda a medição anterior antes de registrar a nova.
+            for video in videos:
+                antiga = conn.execute("""SELECT visualizacoes FROM video_metricas
+                    WHERE email=? AND canal_id=? AND video_id=?
+                    ORDER BY coletado_em DESC LIMIT 1""",
+                    (email, canal_id, video["id"])).fetchone()
+                video["delta_views"] = (video["visualizacoes"] - antiga[0]
+                    if antiga and antiga[0] is not None and video["visualizacoes"] is not None else None)
+                conn.execute("""INSERT INTO video_metricas
+                    (email, canal_id, video_id, visualizacoes, curtidas, comentarios, coletado_em)
+                    VALUES (?,?,?,?,?,?,?)""", (email, canal_id, video["id"],
+                    video["visualizacoes"], video["curtidas"], video["comentarios"], coletado_em))
+
+            mais_recente = ids[0]
+            primeira = not anterior or anterior == "nenhum" or anterior.startswith("yt_video_")
+            novos = [] if primeira or anterior == mais_recente or anterior not in ids else ids[:ids.index(anterior)]
+            if primeira or anterior not in ids:
+                conn.execute("UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
+                             (mais_recente, email, canal))
+                mensagem = f"{nome}: referência sincronizada; exibindo os últimos 5 vídeos."
+            elif novos:
+                token, chat_id = ler_config_telegram_db(email)
+                falha = False
+                for video_id in reversed(novos):
+                    aviso = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\nhttps://www.youtube.com/watch?v={video_id}"
+                    if token and chat_id and not enviar_alerta_telegram(token, chat_id, aviso):
+                        falha = True
+                        break
+                if not falha:
+                    conn.execute("UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
+                                 (mais_recente, email, canal))
+                mensagem = (f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s)." if not falha
+                            else f"{nome}: falha ao enviar Telegram; tentativa será repetida.")
+            else:
+                mensagem = f"{nome}: sem vídeos novos; métricas atualizadas."
+        return bool(novos), mensagem, {"nome": nome, "videos": videos, "coletado_em": coletado_em}
+    except (requests.RequestException, ValueError, KeyError, sqlite3.Error) as erro:
+        return False, f"Erro ao consultar {canal}: {erro}", None
+
+
+def mostrar_resultados_youtube(painel):
+    if not painel:
+        return
+    st.markdown(f"#### {painel['nome']} — últimos 5 vídeos")
+    st.caption(f"Consulta em UTC: {painel['coletado_em'][:19].replace('T', ' ')}")
+    for video in painel["videos"]:
+        with st.container(border=True):
+            col_img, col_info = st.columns([1, 3])
+            with col_img:
+                if video["imagem"]:
+                    st.image(video["imagem"], use_container_width=True)
+            with col_info:
+                st.markdown(f"**{video['titulo']}**")
+                st.caption(f"Publicado: {video['publicado'][:10] or 'Não informado'}")
+                st.link_button("▶ Assistir", video["url"])
+            def fmt(valor):
+                return f"{valor:,}".replace(",", ".") if valor is not None else "Indisponível"
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Visualizações", fmt(video["visualizacoes"]),
+                      delta=fmt(video["delta_views"]) if video["delta_views"] is not None else None)
+            c2.metric("Curtidas", fmt(video["curtidas"]))
+            c3.metric("Comentários", fmt(video["comentarios"]))
 
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
@@ -460,8 +519,9 @@ if opcao == "Painel Principal":
         
         if st.button("🔄 Executar Varredura e Checar Novos Vídeos", key="btn_checar_posts"):
             for p in perfis_cadastrados:
-                _, resultado = checar_novos_posts_perfil(email_usuario, p)
-                st.write(resultado)
+                _, resultado, painel = checar_novos_posts_perfil(email_usuario, p)
+                st.info(resultado)
+                mostrar_resultados_youtube(painel)
     else:
         st.info("Nenhum canal cadastrado ainda. Adicione acima para começar.")
 
