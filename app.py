@@ -3,6 +3,10 @@ import os
 import sqlite3
 import hashlib
 import requests
+import json
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -74,6 +78,11 @@ def inicializar_banco():
         coletado_em TEXT NOT NULL,
         PRIMARY KEY(email, canal_id, video_id, coletado_em)
     )""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS snapshots_perfil (
+        email TEXT NOT NULL, perfil TEXT NOT NULL, painel_json TEXT NOT NULL,
+        atualizado_em TEXT NOT NULL, novo INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(email, perfil)
+    )""")
     conn.commit()
     conn.close()
 
@@ -136,6 +145,7 @@ def excluir_perfil_db(email, perfil_alvo):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM perfis WHERE email = ? AND perfil = ?", (email, perfil_alvo))
+    conn.execute("DELETE FROM snapshots_perfil WHERE email=? AND perfil=?", (email, perfil_alvo))
     conn.commit()
     conn.close()
     return True
@@ -363,13 +373,102 @@ def mostrar_resultados_youtube(painel):
             c2.metric("Curtidas", fmt(video["curtidas"]))
             c3.metric("Comentários", fmt(video["comentarios"]))
 
+
+# ==========================================
+# CACHE DE RESULTADOS E EXPORTAÇÃO
+# ==========================================
+def salvar_snapshot(email, perfil, painel, novo):
+    if painel is None:
+        return
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""INSERT INTO snapshots_perfil
+            (email, perfil, painel_json, atualizado_em, novo)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(email, perfil) DO UPDATE SET
+            painel_json=excluded.painel_json,
+            atualizado_em=excluded.atualizado_em,
+            novo=excluded.novo""",
+            (email, perfil, json.dumps(painel, ensure_ascii=False),
+             painel.get("coletado_em", datetime.now(timezone.utc).isoformat()), int(novo)))
+
+
+def ler_snapshots(email):
+    with sqlite3.connect(DB_NAME) as conn:
+        registros = conn.execute("""SELECT perfil, painel_json, atualizado_em, novo
+            FROM snapshots_perfil WHERE email=?""", (email,)).fetchall()
+    return {p: {"painel": json.loads(j), "atualizado": t, "novo": bool(n)}
+            for p, j, t, n in registros}
+
+
+def linhas_relatorio(perfis, snapshots):
+    linhas = []
+    for perfil in perfis:
+        dado = snapshots.get(perfil)
+        if not dado:
+            continue
+        painel = dado["painel"]
+        for pos, video in enumerate(painel.get("videos", []), 1):
+            linhas.append({
+                "Perfil": perfil, "Nome do canal": painel.get("nome", perfil),
+                "Rede": "YouTube", "Posição": pos,
+                "Título": video.get("titulo", ""),
+                "Publicado em (UTC)": video.get("publicado", ""),
+                "Visualizações": video.get("visualizacoes"),
+                "Variação de visualizações": video.get("delta_views"),
+                "Curtidas": video.get("curtidas"),
+                "Comentários": video.get("comentarios"),
+                "Link": video.get("url", ""),
+                "Consultado em (UTC)": dado["atualizado"]
+            })
+    return linhas
+
+
+def gerar_excel(linhas):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Vídeos monitorados"
+    colunas = ["Perfil", "Nome do canal", "Rede", "Posição", "Título",
+               "Publicado em (UTC)", "Visualizações", "Variação de visualizações",
+               "Curtidas", "Comentários", "Link", "Consultado em (UTC)"]
+    ws.append(colunas)
+    for celula in ws[1]:
+        celula.font = Font(bold=True, color="FFFFFF")
+        celula.fill = PatternFill("solid", fgColor="183153")
+    for linha in linhas:
+        ws.append([linha.get(coluna) for coluna in colunas])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col in ws.columns:
+        letra = col[0].column_letter
+        ws.column_dimensions[letra].width = min(55, max(14, max(len(str(c.value or "")) for c in col) + 2))
+    saida = io.BytesIO()
+    wb.save(saida)
+    return saida.getvalue()
+
+
+def gerar_txt(linhas):
+    if not linhas:
+        return "Nenhum dado coletado até o momento."
+    return "\n\n".join("\n".join(f"{chave}: {valor if valor is not None else 'Indisponível'}"
+                                   for chave, valor in linha.items()) for linha in linhas)
+
+
+def formato_views(valor):
+    if valor is None:
+        return "s/d"
+    if valor >= 1_000_000:
+        return f"{valor / 1_000_000:.1f} mi".replace(".", ",")
+    if valor >= 1_000:
+        return f"{valor / 1_000:.1f} mil".replace(".", ",")
+    return str(valor)
+
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
 # ==========================================
 st.set_page_config(
     page_title="ViralRadar - Monitor de Tendências",
     page_icon="🚀",
-    layout="centered"
+    layout="wide"
 )
 
 if "logado" not in st.session_state:
@@ -465,65 +564,93 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("Adicionar Canal do YouTube para Monitoramento")
-    
-    st.markdown(f"**Uso do Plano:** {qtd_atual} de {LIMITE_PLANO_INICIAL} canais cadastrados.")
-    st.progress(qtd_atual / LIMITE_PLANO_INICIAL if LIMITE_PLANO_INICIAL > 0 else 0)
-    
-    st.info(f"🔄 **Substituições no mês:** Você usou {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL} trocas permitidas ({trocas_restantes} restantes).")
-    
-    with st.form("form_perfil_v9", clear_on_submit=True):
-        perfil_input = st.text_input("Digite o nome ou ID do canal (ex: MrBeast):")
-        enviado = st.form_submit_button("Cadastrar Canal")
-        
+    st.subheader("📡 ViralRadar 3.0 — Central multirredes")
+    st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
+    st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
+
+    with st.form("form_perfil_v30", clear_on_submit=True):
+        perfil_input = st.text_input("Canal YouTube (@handle, link ou ID):")
+        enviado = st.form_submit_button("➕ Cadastrar perfil")
         if enviado:
-            if perfil_input:
-                perfil_limpo = perfil_input.strip()
-                
-                if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
-                    if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
-                        st.error(f"⚠️ Limite de {LIMITE_PLANO_INICIAL} canais atingido e suas trocas mensais esgotaram!")
-                    else:
-                        st.warning("⚠️ Limite de canais atingido. Exclua um canal existente para liberar vaga.")
-                else:
-                    sucesso, status = salvar_perfil_db(email_usuario, perfil_limpo)
-                    if sucesso:
-                        st.success(f"Canal '{perfil_limpo}' cadastrado com sucesso!")
-                        st.rerun()
-                    elif status == "Duplicado":
-                        st.warning("Este canal já está cadastrado na sua lista.")
+            if not perfil_input.strip():
+                st.warning("Informe um canal válido.")
+            elif qtd_atual >= LIMITE_PLANO_INICIAL:
+                st.warning("Limite de canais atingido. Exclua um para liberar vaga.")
             else:
-                st.warning("Por favor, digite um nome de canal válido.")
-            
-    st.markdown("### 📋 Canais Monitorados")
-    
+                sucesso, status = salvar_perfil_db(email_usuario, perfil_input.strip())
+                if sucesso:
+                    st.success("Canal cadastrado. Execute a primeira consulta para carregar os dados.")
+                    st.rerun()
+                else:
+                    st.warning(status)
+
     if perfis_cadastrados:
-        for p in perfis_cadastrados:
-            st.markdown(f"📺 **`{p}`**")
-            
-            bcol1, bcol2, bcol3 = st.columns(3)
-            with bcol1:
-                if st.button(f"▶️ Assistir", key=f"assistir_{p}"):
-                    st.info(f"Abrindo canal {p}...")
-            with bcol2:
-                if st.button(f"📥 Salvar Ref.", key=f"baixar_{p}"):
-                    st.success(f"Referência de {p} salva nos favoritos!")
-            with bcol3:
-                if st.button(f"🗑️ Excluir", key=f"excluir_{p}"):
-                    if excluir_perfil_db(email_usuario, p):
-                        if qtd_atual >= LIMITE_PLANO_INICIAL:
-                            registrar_substituicao_db(email_usuario)
-                        st.success(f"Canal {p} removido!")
+        if st.button("🔄 Consultar YouTube e atualizar todos", type="primary"):
+            progresso = st.progress(0)
+            with st.spinner("Consultando canais cadastrados..."):
+                for idx, perfil in enumerate(perfis_cadastrados):
+                    novo, mensagem, painel = checar_novos_posts_perfil(email_usuario, perfil)
+                    salvar_snapshot(email_usuario, perfil, painel, novo)
+                    if painel is None:
+                        st.warning(mensagem)
+                    progresso.progress((idx + 1) / len(perfis_cadastrados))
+            st.rerun()
+
+        snapshots = ler_snapshots(email_usuario)
+        st.caption("A tabela abaixo lê os últimos resultados salvos, sem consumir a API ao abrir a página.")
+        cab = st.columns([3, 2, 2, 2, 2, 2])
+        for coluna, titulo in zip(cab, ["Perfil", "▶ YouTube", "TikTok", "Instagram", "Facebook", "X"]):
+            coluna.markdown(f"**{titulo}**")
+        for perfil in perfis_cadastrados:
+            dado = snapshots.get(perfil)
+            painel = dado["painel"] if dado else None
+            videos = painel.get("videos", []) if painel else []
+            ultimo = videos[0] if videos else None
+            nome = painel.get("nome", perfil) if painel else perfil
+            colunas = st.columns([3, 2, 2, 2, 2, 2])
+            colunas[0].write(nome)
+            if ultimo:
+                simbolo = "🟢" if dado["novo"] else "⚪"
+                colunas[1].write(f"{simbolo} {formato_views(ultimo.get('visualizacoes'))}")
+            else:
+                colunas[1].write("⏳ Pendente")
+            for coluna in colunas[2:]:
+                coluna.caption("—")
+            with st.expander(f"Detalhes · {nome}"):
+                if dado:
+                    st.caption(f"Última consulta (UTC): {dado['atualizado']} | 🟢 Novidade na última consulta · ⚪ Sem novidade")
+                    mostrar_resultados_youtube(painel)
+                else:
+                    st.info("Ainda não consultado. Clique em atualizar todos.")
+                a, b = st.columns(2)
+                if a.button("🔄 Atualizar somente este perfil", key=f"atualizar_{perfil}"):
+                    novo, mensagem, painel_novo = checar_novos_posts_perfil(email_usuario, perfil)
+                    salvar_snapshot(email_usuario, perfil, painel_novo, novo)
+                    if painel_novo:
                         st.rerun()
-            st.markdown("---")
-        
-        if st.button("🔄 Executar Varredura e Checar Novos Vídeos", key="btn_checar_posts"):
-            for p in perfis_cadastrados:
-                _, resultado, painel = checar_novos_posts_perfil(email_usuario, p)
-                st.info(resultado)
-                mostrar_resultados_youtube(painel)
+                    else:
+                        st.error(mensagem)
+                if b.button("🗑️ Excluir perfil", key=f"excluir_{perfil}"):
+                    excluir_perfil_db(email_usuario, perfil)
+                    if qtd_atual >= LIMITE_PLANO_INICIAL:
+                        registrar_substituicao_db(email_usuario)
+                    st.rerun()
+
+        st.divider()
+        st.subheader("📥 Exportar relatórios")
+        linhas = linhas_relatorio(perfis_cadastrados, snapshots)
+        if linhas:
+            x, y = st.columns(2)
+            x.download_button("📊 Baixar Excel (.xlsx)", gerar_excel(linhas),
+                              file_name="viralradar_relatorio.xlsx",
+                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            y.download_button("📄 Baixar TXT", gerar_txt(linhas).encode("utf-8-sig"),
+                              file_name="viralradar_relatorio.txt", mime="text/plain")
+            st.caption(f"{len(linhas)} vídeos no relatório, com métricas da última consulta registrada.")
+        else:
+            st.info("Execute a primeira consulta para habilitar os relatórios.")
     else:
-        st.info("Nenhum canal cadastrado ainda. Adicione acima para começar.")
+        st.info("Cadastre seu primeiro canal para começar.")
 
 elif opcao == "🔥 Tendências e Assuntos":
     st.subheader("🔥 Tracker de Assuntos e Vídeos em Alta no YouTube")
