@@ -210,59 +210,99 @@ def enviar_alerta_telegram(token, chat_id, mensagem):
         print(f"Erro ao disparar Telegram: {e}")
         return False
 
+def consultar_youtube(endpoint, parametros):
+    """Consulta a API oficial sem expor a chave nos logs."""
+    chave = st.secrets["YOUTUBE_API_KEY"]
+    resposta = requests.get(
+        f"https://www.googleapis.com/youtube/v3/{endpoint}",
+        params={**parametros, "key": chave}, timeout=15
+    )
+    resposta.raise_for_status()
+    return resposta.json()
+
+
+def identificar_canal_youtube(entrada):
+    """Aceita @handle, URL /@handle, URL /channel/UC... ou ID UC..."""
+    from urllib.parse import urlparse
+    entrada = entrada.strip()
+    if entrada.startswith(("https://", "http://")):
+        url = urlparse(entrada)
+        if url.hostname not in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+            raise ValueError("Informe um link do YouTube válido.")
+        partes = url.path.strip("/").split("/")
+        if partes[0] == "channel" and len(partes) > 1:
+            entrada = partes[1]
+        elif partes[0].startswith("@"):
+            entrada = partes[0]
+        else:
+            raise ValueError("Use o link /@handle ou /channel/ID do canal.")
+    if entrada.startswith("UC") and len(entrada) == 24:
+        parametros = {"part": "snippet,contentDetails", "id": entrada}
+    else:
+        parametros = {"part": "snippet,contentDetails", "forHandle": entrada.lstrip("@")}
+    dados = consultar_youtube("channels", parametros)
+    itens = dados.get("items", [])
+    if not itens:
+        raise ValueError("Canal não encontrado. Confira o @handle ou ID.")
+    item = itens[0]
+    return item["id"], item["snippet"]["title"], item["contentDetails"]["relatedPlaylists"]["uploads"]
+
+
 def checar_novos_posts_perfil(email, canal):
-    """
-    Motor de varredura real para buscar os vídeos mais recentes do YouTube.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT ultimo_post_id FROM perfis WHERE email = ? AND perfil = ?", (email, canal))
-    res = cursor.fetchone()
-    ultimo_salvo = res[0] if res else "nenhum"
-    conn.close()
-
+    """Consulta vídeos reais e avisa apenas depois da sincronização inicial."""
     try:
-        # ID simulado de alta precisão pronto para validação em produção
-        novo_id_encontrado = f"yt_video_{canal}_recente"
-        video_url = f"https://youtube.com/@{canal}/videos"
+        canal_id, nome, uploads = identificar_canal_youtube(canal)
+        dados = consultar_youtube("playlistItems", {
+            "part": "snippet,contentDetails", "playlistId": uploads, "maxResults": 10
+        })
+        videos = [
+            item["contentDetails"]["videoId"]
+            for item in dados.get("items", [])
+            if item.get("contentDetails", {}).get("videoId")
+        ]
+        if not videos:
+            return False, f"Nenhum vídeo público encontrado em {nome}."
 
-        if ultimo_salvo == "nenhum" or ultimo_salvo is None or ultimo_salvo == "":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, canal))
-            conn.commit()
-            conn.close()
-            registrar_historico_db(f"Canal do YouTube '{canal}' sincronizado com sucesso.")
-            return False, "Sincronizado"
-
-        elif novo_id_encontrado != ultimo_salvo:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE perfis SET ultimo_post_id = ? WHERE email = ? AND perfil = ?", (novo_id_encontrado, email, canal))
-            conn.commit()
-            conn.close()
-
-            msg = (
-                f"🚨 *NOVO VÍDEO NO YOUTUBE!*\n\n"
-                f"📺 *Canal:* {canal}\n"
-                f"⏱️ *Status:* Publicado agora há pouco!\n"
-                f"🔗 [Assistir ao Vídeo]({video_url})"
-            )
-            
-            registrar_historico_db(f"Alerta do YouTube disparado para {canal}")
-            
+        with sqlite3.connect(DB_NAME) as conn:
+            linha = conn.execute(
+                "SELECT ultimo_post_id FROM perfis WHERE email=? AND perfil=?",
+                (email, canal)
+            ).fetchone()
+            if linha is None:
+                return False, "Canal não está cadastrado."
+            anterior = linha[0]
+            mais_recente = videos[0]
+            if not anterior or anterior == "nenhum" or anterior.startswith("yt_video_"):
+                conn.execute(
+                    "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
+                    (mais_recente, email, canal)
+                )
+                return False, f"{nome} sincronizado. Próximas publicações serão verificadas."
+            if anterior == mais_recente:
+                return False, f"{nome}: sem novos vídeos."
+            if anterior not in videos:
+                # Evita falsos alertas quando o vídeo anterior sai da janela consultada.
+                conn.execute(
+                    "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
+                    (mais_recente, email, canal)
+                )
+                return False, f"{nome}: referência antiga fora dos últimos 10; sincronizado sem alerta."
+            novos = videos[:videos.index(anterior)]
             token, chat_id = ler_config_telegram_db(email)
-            if token and chat_id:
-                enviar_alerta_telegram(token, chat_id, msg)
-                
-            return True, "Novo vídeo detectado!"
-
-    except Exception as e:
-        registrar_historico_db(f"Erro na varredura do canal {canal}: {e}")
-        return False, str(e)
-
-    registrar_historico_db(f"Varredura concluída para o canal {canal} (Nenhum vídeo novo).")
-    return False, "Sem novos vídeos"
+            # Não avança a referência se o envio configurado falhar.
+            for video_id in reversed(novos):
+                link = f"https://www.youtube.com/watch?v={video_id}"
+                mensagem = f"🚨 NOVO VÍDEO NO YOUTUBE!\nCanal: {nome}\n{link}"
+                if token and chat_id and not enviar_alerta_telegram(token, chat_id, mensagem):
+                    return False, f"{nome}: falha no Telegram; referência mantida para nova tentativa."
+            conn.execute(
+                "UPDATE perfis SET ultimo_post_id=? WHERE email=? AND perfil=?",
+                (mais_recente, email, canal)
+            )
+        registrar_historico_db(f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s).")
+        return True, f"{nome}: {len(novos)} novo(s) vídeo(s) detectado(s)."
+    except (requests.RequestException, ValueError, KeyError) as erro:
+        return False, f"Erro ao consultar {canal}: {erro}"
 
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA STREAMLIT
@@ -379,7 +419,7 @@ if opcao == "Painel Principal":
         
         if enviado:
             if perfil_input:
-                perfil_limpo = perfil_input.replace("@", "").strip()
+                perfil_limpo = perfil_input.strip()
                 
                 if len(perfis_cadastrados) >= LIMITE_PLANO_INICIAL:
                     if trocas_utilizadas >= LIMITE_TROCAS_MENSAL:
@@ -420,9 +460,8 @@ if opcao == "Painel Principal":
         
         if st.button("🔄 Executar Varredura e Checar Novos Vídeos", key="btn_checar_posts"):
             for p in perfis_cadastrados:
-                checar_novos_posts_perfil(email_usuario, p)
-            st.success("Varredura concluída com sucesso! Verifique o Histórico de Alertas.")
-            st.rerun()
+                _, resultado = checar_novos_posts_perfil(email_usuario, p)
+                st.write(resultado)
     else:
         st.info("Nenhum canal cadastrado ainda. Adicione acima para começar.")
 
