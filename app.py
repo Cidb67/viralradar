@@ -346,6 +346,62 @@ def mostrar_resultados_youtube(painel):
             c3.metric("Comentários", fmt(video["comentarios"]))
 
 
+def ler_execucoes_automaticas(email, limite=10):
+    """Consulta apenas o histórico do usuário autenticado; não chama a API YouTube."""
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT iniciado_em, finalizado_em, status,
+                       canais_consultados, videos_detectados, erros
+                       FROM monitoramento_execucoes
+                       WHERE email=%s ORDER BY iniciado_em DESC LIMIT %s""",
+                        (email, limite))
+            return cur.fetchall()
+
+
+def mostrar_monitoramento_automatico(email):
+    st.markdown("### 🤖 Monitoramento automático")
+    try:
+        execucoes = ler_execucoes_automaticas(email)
+    except psycopg2.Error:
+        st.warning("Não foi possível consultar o histórico automático agora. Tente atualizar a tela.")
+        return
+
+    if not execucoes:
+        st.info("Ainda não há verificações automáticas registradas para esta conta.")
+        return
+
+    inicio, fim, status, canais, videos, erros = execucoes[0]
+    status_legenda = {"sucesso": "✅ Concluído com sucesso",
+                      "falha": "🔴 Concluído com falha",
+                      "em_andamento": "🟡 Em andamento"}.get(status, "⚪ Não identificado")
+    inicio_br = horario_brasilia(inicio)
+    if inicio_br and (datetime.now(FUSO_BRASIL) - inicio_br).total_seconds() > 45 * 60:
+        st.warning("A última verificação registrada tem mais de 45 minutos. Confira o agendamento no GitHub Actions.")
+
+    st.caption("Última verificação iniciada: " + exibir_horario_br(inicio) +
+               " (Brasília) | Finalizada: " + exibir_horario_br(fim))
+    st.write("**Resultado da última execução:** " + status_legenda)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Canais consultados", canais)
+    c2.metric("Vídeos detectados", videos)
+    c3.metric("Erros", erros)
+    st.caption("Informações do Supabase, atualizadas ao recarregar a página. "
+               "A programação de 15 minutos depende do GitHub Actions e pode sofrer atrasos.")
+
+    with st.expander("📋 Histórico das últimas verificações"):
+        linhas = []
+        for ini, terminado, situacao, qtd_canais, qtd_videos, qtd_erros in execucoes:
+            linhas.append({
+                "Início (Brasília)": exibir_horario_br(ini),
+                "Fim (Brasília)": exibir_horario_br(terminado),
+                "Status": situacao,
+                "Canais": qtd_canais,
+                "Vídeos detectados": qtd_videos,
+                "Erros": qtd_erros,
+            })
+        st.dataframe(linhas, hide_index=True, use_container_width=True)
+
+
 # ==========================================
 # CACHE DE RESULTADOS E EXPORTAÇÃO
 # ==========================================
@@ -712,9 +768,12 @@ trocas_utilizadas = ler_trocas_db(email_usuario)
 trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
 
 if opcao == "Painel Principal":
-    st.subheader("📡 ViralRadar 3.3.1 — Central multirredes")
+    st.subheader("📡 ViralRadar 3.5 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
     st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
+
+    mostrar_monitoramento_automatico(email_usuario)
+    st.divider()
 
     with st.form("form_perfil_v30", clear_on_submit=True):
         perfil_input = st.text_input("Canal YouTube (@handle, link ou ID):")
