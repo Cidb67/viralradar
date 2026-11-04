@@ -1079,8 +1079,10 @@ elif opcao == "🛡️ Administração":
         operacao = st.radio("Ação", ["Liberar por prazo", "Suspender", "Cancelar"], horizontal=True)
         dias = st.number_input("Dias de acesso a partir de hoje (para liberação)", min_value=1, max_value=366, value=30)
         confirmar = st.checkbox("Confirmo que desejo alterar a autorização desta conta")
-        enviar = st.form_submit_button("Aplicar alteração", disabled=not confirmar)
-    if enviar:
+        enviar = st.form_submit_button("Aplicar alteração")
+    if enviar and not confirmar:
+        st.warning("Marque a caixa de confirmação antes de aplicar a alteração.")
+    elif enviar:
         try:
             novo_status = {"Liberar por prazo": "ativa", "Suspender": "suspensa", "Cancelar": "cancelada"}[operacao]
             atualizar_assinatura_admin(alvo, plano, modalidade, novo_status, int(dias))
