@@ -49,6 +49,79 @@ def conectar_banco():
     )
 
 
+# Permissões e assinaturas (fonte de verdade: Supabase PostgreSQL)
+PLANOS_VIRALRADAR = {
+    "inicial": {"nome": "Inicial", "canais": 10, "trocas": 5, "mensal": "R$ 19,99", "anual": "R$ 179,88"},
+    "criador": {"nome": "Criador", "canais": 20, "trocas": 10, "mensal": "R$ 29,99", "anual": "R$ 299,88"},
+    "agencia": {"nome": "Agência", "canais": 50, "trocas": 20, "mensal": "R$ 69,99", "anual": "R$ 779,88"},
+}
+
+
+def eh_administrador(email):
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS(SELECT 1 FROM public.administradores WHERE email=%s)", (email,))
+            return bool(cur.fetchone()[0])
+
+
+def consultar_assinatura(email):
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT plano, modalidade, status, inicio_em, vencimento_em,
+                                  limite_canais, limite_trocas
+                           FROM public.assinaturas WHERE email=%s""", (email,))
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(zip(("plano", "modalidade", "status", "inicio_em", "vencimento_em",
+                     "limite_canais", "limite_trocas"), row))
+
+
+def assinatura_valida(assinatura):
+    if not assinatura or assinatura["status"] != "ativa":
+        return False
+    inicio, fim = assinatura["inicio_em"], assinatura["vencimento_em"]
+    agora = datetime.now(timezone.utc)
+    return bool(inicio and fim and inicio <= agora < fim)
+
+
+def listar_clientes_admin():
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT u.email, COALESCE(a.plano, 'sem plano'),
+                                  COALESCE(a.modalidade, '-'), COALESCE(a.status, 'sem assinatura'),
+                                  a.vencimento_em, a.limite_canais, a.limite_trocas
+                           FROM public.usuarios u
+                           LEFT JOIN public.assinaturas a ON a.email=u.email
+                           ORDER BY u.email""")
+            return cur.fetchall()
+
+
+def atualizar_assinatura_admin(email, plano, modalidade, status, dias):
+    limites = PLANOS_VIRALRADAR[plano]
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.usuarios WHERE email=%s", (email,))
+            if not cur.fetchone():
+                raise ValueError("Usuário não encontrado")
+            # Bloqueio e reativação mantêm o vencimento existente.
+            if status == "ativa":
+                cur.execute("""INSERT INTO public.assinaturas
+                    (email, plano, modalidade, status, limite_canais, limite_trocas, inicio_em, vencimento_em)
+                    VALUES (%s,%s,%s,'ativa',%s,%s,NOW(),NOW()+(%s * INTERVAL '1 day'))
+                    ON CONFLICT (email) DO UPDATE SET
+                    plano=EXCLUDED.plano, modalidade=EXCLUDED.modalidade,
+                    status='ativa', limite_canais=EXCLUDED.limite_canais,
+                    limite_trocas=EXCLUDED.limite_trocas, inicio_em=EXCLUDED.inicio_em,
+                    vencimento_em=EXCLUDED.vencimento_em, atualizado_em=NOW()""",
+                    (email, plano, modalidade, limites["canais"], limites["trocas"], dias))
+            else:
+                cur.execute("""UPDATE public.assinaturas SET status=%s, atualizado_em=NOW()
+                               WHERE email=%s""", (status, email))
+                if cur.rowcount == 0:
+                    raise ValueError("Não existe assinatura para suspender")
+
+
 def criar_hash_senha(senha):
     """PBKDF2 com salt aleatório; também aceitamos hashes legados no login."""
     import secrets
@@ -106,7 +179,14 @@ def salvar_perfil_db(email, novo_perfil):
     with conectar_banco() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM perfis WHERE email=%s", (email,))
-            if cur.fetchone()[0] >= LIMITE_PLANO_INICIAL:
+            quantidade = cur.fetchone()[0]
+            cur.execute("""SELECT limite_canais FROM public.assinaturas
+                           WHERE email=%s AND status='ativa'
+                           AND inicio_em<=NOW() AND vencimento_em>NOW()""", (email,))
+            limite = cur.fetchone()
+            if not limite:
+                return False, "Assinatura inativa"
+            if quantidade >= limite[0]:
                 return False, "Limite atingido"
             cur.execute("INSERT INTO perfis (email, perfil, ultimo_post_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING perfil",
                         (email, novo_perfil, "nenhum"))
@@ -138,7 +218,12 @@ def salvar_troca_db(email, qtd):
 def registrar_substituicao_db(email):
     with conectar_banco() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE metricas SET trocas=trocas+1 WHERE email=%s AND trocas < %s RETURNING trocas", (email, LIMITE_TROCAS_MENSAL))
+            cur.execute("""UPDATE metricas SET trocas=trocas+1
+                           WHERE email=%s AND trocas < (
+                               SELECT limite_trocas FROM public.assinaturas
+                               WHERE email=%s AND status='ativa'
+                               AND inicio_em<=NOW() AND vencimento_em>NOW()) RETURNING trocas""",
+                        (email, email))
             return cur.fetchone() is not None
 
 
@@ -735,21 +820,25 @@ if not st.session_state.logado:
 st.title("🚀 ViralRadar - Painel de Controle Inteligente")
 st.markdown(f"Monitoramento de canais e tendências | 👤 **{st.session_state.usuario_atual}**")
 
+email_usuario = st.session_state.usuario_atual
+try:
+    administrador = eh_administrador(email_usuario)
+    assinatura = consultar_assinatura(email_usuario)
+except psycopg2.Error:
+    st.error("Não foi possível consultar as permissões. Tente novamente mais tarde.")
+    st.stop()
+
+acesso_ativo = assinatura_valida(assinatura)
+limite_canais = assinatura["limite_canais"] if acesso_ativo else 0
+limite_trocas = assinatura["limite_trocas"] if acesso_ativo else 0
+
 with st.sidebar:
     st.header("📌 Menu")
-    opcao = st.radio(
-        "Seção:", 
-        [
-            "Painel Principal", 
-            "🔥 Tendências e Assuntos", 
-            "Histórico de Alertas", 
-            "Configurar Telegram",
-            "Assinatura / Planos", 
-            "Finalizar Compra / Pagamento", 
-            "Suporte"
-        ], 
-        key="menu_principal_viralradar_v9"
-    )
+    opcoes = ["Painel Principal", "🔥 Tendências e Assuntos", "Histórico de Alertas",
+              "Configurar Telegram", "Assinatura / Planos", "Finalizar Compra / Pagamento", "Suporte"]
+    if administrador:
+        opcoes.append("🛡️ Administração")
+    opcao = st.radio("Seção:", opcoes, key="menu_principal_viralradar_admin_v1")
     st.markdown("---")
     st.markdown("**Status do Sistema:** 🟢 Online (YouTube API)")
     
@@ -761,16 +850,20 @@ with st.sidebar:
     if st.button("🔄 Atualizar Tela", key="btn_atualizar_geral_v9"):
         st.rerun()
 
-email_usuario = st.session_state.usuario_atual
+# Uma conta sem assinatura pode ver os planos, mas não operar o monitoramento.
+if not acesso_ativo and opcao not in ("Assinatura / Planos", "Finalizar Compra / Pagamento", "Suporte", "🛡️ Administração"):
+    st.warning("Sua conta não possui assinatura ativa. Escolha um plano ou entre em contato com o suporte.")
+    st.stop()
+
 perfis_cadastrados = ler_perfis_db(email_usuario)
 qtd_atual = len(perfis_cadastrados)
 trocas_utilizadas = ler_trocas_db(email_usuario)
-trocas_restantes = LIMITE_TROCAS_MENSAL - trocas_utilizadas
+trocas_restantes = max(0, limite_trocas - trocas_utilizadas)
 
 if opcao == "Painel Principal":
     st.subheader("📡 ViralRadar 3.5 — Central multirredes")
     st.caption("YouTube integrado • TikTok, Instagram, Facebook e X: integrações futuras, sem coleta ainda")
-    st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {LIMITE_PLANO_INICIAL} | **Trocas usadas:** {trocas_utilizadas} de {LIMITE_TROCAS_MENSAL}")
+    st.markdown(f"**Perfis cadastrados:** {qtd_atual} de {limite_canais} | **Trocas usadas:** {trocas_utilizadas} de {limite_trocas}")
 
     mostrar_monitoramento_automatico(email_usuario)
     st.divider()
@@ -781,7 +874,7 @@ if opcao == "Painel Principal":
         if enviado:
             if not perfil_input.strip():
                 st.warning("Informe um canal válido.")
-            elif qtd_atual >= LIMITE_PLANO_INICIAL:
+            elif qtd_atual >= limite_canais:
                 st.warning("Limite de canais atingido. Exclua um para liberar vaga.")
             else:
                 sucesso, status = salvar_perfil_db(email_usuario, perfil_input.strip())
@@ -873,7 +966,7 @@ if opcao == "Painel Principal":
                         st.error(mensagem)
                 if b.button("🗑️ Excluir perfil", key=f"excluir_{perfil}"):
                     excluir_perfil_db(email_usuario, perfil)
-                    if qtd_atual >= LIMITE_PLANO_INICIAL:
+                    if qtd_atual >= limite_canais:
                         registrar_substituicao_db(email_usuario)
                     st.rerun()
 
@@ -941,40 +1034,60 @@ elif opcao == "Configurar Telegram":
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    st.markdown("Escolha o plano ideal para o seu volume de monitoramento:")
-    
-    col_p1, col_p2, col_p3 = st.columns(3)
-    with col_p1:
-        st.markdown("### 🥉 Inicial")
-        st.markdown("**R$ 29,90 / mês**")
-        st.markdown("• 5 Canais/Perfis\n• Alertas via Telegram\n• Histórico básico")
-        if st.button("💳 Assinar Inicial", key="plan_inicial"):
-            st.session_state.plano_checkout = "Plano Inicial — R$ 29,90/mês"
-            st.success("Plano selecionado! Vá até a aba de Pagamento.")
-    with col_p2:
-        st.markdown("### 🥈 Criador")
-        st.markdown("**R$ 59,90 / mês**")
-        st.markdown("• 15 Canais/Perfis\n• Alertas prioritários\n• 5 Trocas mensais")
-        if st.button("💳 Assinar Criador", key="plan_criador"):
-            st.session_state.plano_checkout = "Plano Criador — R$ 59,90/mês"
-            st.success("Plano selecionado! Vá até a aba de Pagamento.")
-    with col_p3:
-        st.markdown("### 🥇 Agência")
-        st.markdown("**R$ 119,90 / mês**")
-        st.markdown("• 40 Canais/Perfis\n• Monitoramento em tempo real\n• Suporte dedicado")
-        if st.button("💳 Assinar Agência", key="plan_agencia"):
-            st.session_state.plano_checkout = "Plano Agência — R$ 119,90/mês"
-            st.success("Plano selecionado! Vá até a aba de Pagamento.")
+    st.caption("Pagamento ainda não integrado. Os preços abaixo são informativos.")
+    cols = st.columns(3)
+    for coluna, (codigo, plano) in zip(cols, PLANOS_VIRALRADAR.items()):
+        with coluna:
+            st.markdown(f"### {plano['nome']}")
+            st.markdown(f"**{plano['mensal']} / mês**")
+            st.markdown(f"**{plano['anual']} / ano** (pagamento único)")
+            st.write(f"{plano['canais']} canais • {plano['trocas']} trocas mensais • Telegram")
+            if st.button(f"Selecionar {plano['nome']}", key=f"plano_{codigo}"):
+                st.session_state.plano_checkout = codigo
+                st.info("Plano selecionado. O pagamento estará disponível após a integração com o Asaas.")
 
 elif opcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
     if st.session_state.plano_checkout:
         st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
         st.info(f"**Plano Escolhido:** {st.session_state.plano_checkout}")
-        if st.button("🚀 Confirmar e Pagar Agora via Pix", key="btn_concluir_pagamento_v9"):
-            st.success("🎉 Pagamento simulado com sucesso! Acesso liberado no sistema!")
+        st.warning("Pagamento ainda não disponível. A integração segura com o Asaas está em desenvolvimento.")
     else:
         st.warning("⚠️ Nenhum plano selecionado ainda! Visite a aba 'Assinatura / Planos' primeiro.")
+
+elif opcao == "🛡️ Administração":
+    # Verificação de autorização no servidor, independente da visibilidade do menu.
+    if not eh_administrador(email_usuario):
+        st.error("Acesso não autorizado.")
+        st.stop()
+    st.subheader("🛡️ Central Administrativa — ViralRadar")
+    st.caption("Gerenciamento manual de testes. Pagamentos Asaas ainda não integrados.")
+    clientes = listar_clientes_admin()
+    st.metric("Clientes cadastrados", len(clientes))
+    st.dataframe([{
+        "E-mail": e, "Plano": p, "Modalidade": m, "Status": status,
+        "Vencimento": exibir_horario_br(venc) if venc else "—",
+        "Canais": lc, "Trocas": lt
+    } for e, p, m, status, venc, lc, lt in clientes], use_container_width=True, hide_index=True)
+    st.divider()
+    st.subheader("Gerenciar autorização")
+    with st.form("admin_assinatura_form"):
+        alvo = st.selectbox("Conta", [r[0] for r in clientes])
+        plano = st.selectbox("Plano", list(PLANOS_VIRALRADAR),
+                             format_func=lambda x: PLANOS_VIRALRADAR[x]["nome"])
+        modalidade = st.selectbox("Modalidade", ["cortesia", "mensal", "anual"])
+        operacao = st.radio("Ação", ["Liberar por prazo", "Suspender", "Cancelar"], horizontal=True)
+        dias = st.number_input("Dias de acesso a partir de hoje (para liberação)", min_value=1, max_value=366, value=30)
+        confirmar = st.checkbox("Confirmo que desejo alterar a autorização desta conta")
+        enviar = st.form_submit_button("Aplicar alteração", disabled=not confirmar)
+    if enviar:
+        try:
+            novo_status = {"Liberar por prazo": "ativa", "Suspender": "suspensa", "Cancelar": "cancelada"}[operacao]
+            atualizar_assinatura_admin(alvo, plano, modalidade, novo_status, int(dias))
+            st.success("Autorização atualizada no Supabase.")
+            st.rerun()
+        except (ValueError, psycopg2.Error) as exc:
+            st.error(f"Não foi possível atualizar: {type(exc).__name__}")
 
 elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
