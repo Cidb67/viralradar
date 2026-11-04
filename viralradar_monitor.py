@@ -67,7 +67,22 @@ def enviar(token, chat_id, nome, video_id):
     return True
 
 
+def assinatura_autorizada(cur, email):
+    """Confere autorização diretamente no banco (falha fechada)."""
+    cur.execute("""SELECT 1 FROM public.assinaturas
+        WHERE email = %s AND status = 'ativa'
+          AND inicio_em <= NOW() AND vencimento_em > NOW()
+        LIMIT 1""", (email,))
+    return cur.fetchone() is not None
+
+
 def monitorar(email, perfil):
+    # Evita consumir API para contas que perderam a autorização.
+    with db() as conn:
+        with conn.cursor() as cur:
+            if not assinatura_autorizada(cur, email):
+                print('Canal ignorado: assinatura não autorizada')
+                return 0
     canal_id, nome, uploads = resolve(perfil)
     itens = youtube('playlistItems', part='contentDetails', playlistId=uploads, maxResults=10).get('items', [])
     ids = [x.get('contentDetails', {}).get('videoId') for x in itens]
@@ -85,6 +100,10 @@ def monitorar(email, perfil):
             cur.execute('SELECT ultimo_post_id FROM perfis WHERE email=%s AND perfil=%s FOR UPDATE', (email, perfil))
             registro = cur.fetchone()
             if not registro:
+                return 0
+            # Revalida imediatamente antes de persistir dados ou enviar alertas.
+            if not assinatura_autorizada(cur, email):
+                print('Canal ignorado: assinatura expirada ou suspensa')
                 return 0
             anterior = registro[0]
             cur.execute('SELECT telegram_chat_id FROM configuracoes WHERE email=%s', (email,))
@@ -170,9 +189,22 @@ def finalizar_execucao(execucao_id, canais, videos, erros):
 def main():
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute('SELECT email, perfil FROM perfis ORDER BY email, perfil')
+            cur.execute('''
+                SELECT email, perfil FROM (
+                    SELECT p.email, p.perfil,
+                           ROW_NUMBER() OVER (PARTITION BY p.email ORDER BY p.perfil) AS posicao,
+                           a.limite_canais
+                    FROM public.perfis p
+                    JOIN public.assinaturas a ON a.email = p.email
+                    WHERE a.status = 'ativa'
+                      AND a.inicio_em <= NOW()
+                      AND a.vencimento_em > NOW()
+                ) autorizados
+                WHERE posicao <= limite_canais
+                ORDER BY email, perfil
+            ''')
             perfis = cur.fetchall()
-    print(f'ViralRadar: {len(perfis)} canais para consultar')
+    print(f'ViralRadar: {len(perfis)} canais autorizados para consultar')
     por_usuario = {}
     for email, perfil in perfis:
         por_usuario.setdefault(email, []).append(perfil)
