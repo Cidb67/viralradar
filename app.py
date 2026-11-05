@@ -122,6 +122,32 @@ def atualizar_assinatura_admin(email, plano, modalidade, status, dias):
                     raise ValueError("Não existe assinatura para suspender")
 
 
+def testar_conexao_asaas_sandbox():
+    """Teste somente leitura no ambiente de homologação do Asaas."""
+    chave = st.secrets.get("ASAAS_SANDBOX_API_KEY") or st.secrets.get("ASAAS_API_KEY")
+    if not chave:
+        return False, ("Chave não encontrada nos Secrets. Use o nome "
+                       "ASAAS_SANDBOX_API_KEY (ou ASAAS_API_KEY).")
+    try:
+        resposta = requests.get(
+            "https://api-sandbox.asaas.com/v3/myAccount",
+            headers={"access_token": str(chave).strip(),
+                     "accept": "application/json",
+                     "User-Agent": "ViralRadar/3.5 (integracao sandbox)"},
+            timeout=15,
+        )
+        if resposta.status_code == 200:
+            return True, "Conexão autenticada com o Asaas Sandbox! Nenhuma cobrança foi criada."
+        if resposta.status_code in (401, 403):
+            return False, (f"Asaas retornou HTTP {resposta.status_code}: "
+                           "verifique se a chave é do Sandbox e está completa.")
+        return False, f"Asaas retornou HTTP {resposta.status_code}. Nenhuma cobrança foi criada."
+    except requests.Timeout:
+        return False, "Tempo esgotado ao conectar ao Asaas Sandbox. Tente novamente."
+    except requests.RequestException:
+        return False, "Não foi possível estabelecer conexão com o Asaas Sandbox."
+
+
 def criar_hash_senha(senha):
     """PBKDF2 com salt aleatório; também aceitamos hashes legados no login."""
     import secrets
@@ -1062,6 +1088,16 @@ elif opcao == "🛡️ Administração":
         st.stop()
     st.subheader("🛡️ Central Administrativa — ViralRadar")
     st.caption("Gerenciamento manual de testes. Pagamentos Asaas ainda não integrados.")
+    with st.expander("🔌 Integração Asaas — testar conexão Sandbox", expanded=True):
+        st.caption("Teste seguro de leitura. Não cria clientes, cobranças ou assinaturas e não exibe a chave.")
+        if st.button("🧪 Testar conexão Asaas Sandbox", key="asaas_sandbox_teste_v1"):
+            with st.spinner("Verificando autenticação no Asaas Sandbox..."):
+                sucesso_asaas, mensagem_asaas = testar_conexao_asaas_sandbox()
+            if sucesso_asaas:
+                st.success(mensagem_asaas)
+            else:
+                st.error(mensagem_asaas)
+    st.divider()
     clientes = listar_clientes_admin()
     st.metric("Clientes cadastrados", len(clientes))
     st.dataframe([{
