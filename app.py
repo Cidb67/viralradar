@@ -1197,10 +1197,12 @@ elif opcao == "Finalizar Compra / Pagamento":
         plano_escolhido = st.session_state.plano_checkout
         st.markdown(f"📦 **Cliente:** `{email_usuario}`")
         st.write(f"**Plano:** {PLANOS_VIRALRADAR[plano_escolhido]['nome']}")
+        # Fora do formulário: o Streamlit atualiza o preço imediatamente ao trocar o período.
+        modalidade_compra = st.radio("Período", ["mensal", "anual"], horizontal=True,
+                                    format_func=lambda x: "Mensal" if x == "mensal" else "Anual (12 meses)",
+                                    key="asaas_periodo_compra_v2")
+        st.write(f"**Valor da assinatura:** R$ {PRECOS_ASAAS[plano_escolhido][modalidade_compra]:.2f}".replace(".", ","))
         with st.form("asaas_checkout_sandbox_v1"):
-            modalidade_compra = st.radio("Período", ["mensal", "anual"], horizontal=True,
-                                        format_func=lambda x: "Mensal" if x == "mensal" else "Anual (12 meses)")
-            st.write(f"**Valor da assinatura:** R$ {PRECOS_ASAAS[plano_escolhido][modalidade_compra]:.2f}".replace(".", ","))
             forma_compra = st.radio("Pagamento", ["PIX", "CREDIT_CARD"], horizontal=True,
                                   format_func=lambda x: "Pix" if x == "PIX" else "Cartão de crédito")
             nome_pagador = st.text_input("Nome completo do responsável pelo pagamento")
