@@ -6,6 +6,9 @@ import hashlib
 import requests
 import json
 import io
+import re
+from decimal import Decimal
+from datetime import date, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import BarChart, Reference
@@ -146,6 +149,120 @@ def testar_conexao_asaas_sandbox():
         return False, "Tempo esgotado ao conectar ao Asaas Sandbox. Tente novamente."
     except requests.RequestException:
         return False, "Não foi possível estabelecer conexão com o Asaas Sandbox."
+
+
+
+# Cobranças de homologação: o webhook registra eventos, mas NÃO ativa assinaturas
+# até que o processador de eventos seja implementado e testado separadamente.
+PRECOS_ASAAS = {
+    "inicial": {"mensal": Decimal("19.99"), "anual": Decimal("179.88")},
+    "criador": {"mensal": Decimal("29.99"), "anual": Decimal("299.88")},
+    "agencia": {"mensal": Decimal("69.99"), "anual": Decimal("779.88")},
+}
+
+
+def asaas_sandbox_requisicao(metodo, rota, payload=None):
+    chave = st.secrets.get("ASAAS_SANDBOX_API_KEY") or st.secrets.get("ASAAS_API_KEY")
+    ambiente = str(st.secrets.get("ASAAS_ENV", "sandbox")).lower().strip()
+    if ambiente != "sandbox" or not chave:
+        raise ValueError("Checkout de teste indisponível: confira ASAAS_ENV=sandbox e a chave Asaas.")
+    try:
+        resposta = requests.request(
+            metodo, "https://api-sandbox.asaas.com/v3/" + rota.lstrip("/"),
+            headers={"access_token": str(chave).strip(), "accept": "application/json",
+                     "Content-Type": "application/json", "User-Agent": "ViralRadar/3.5"},
+            json=payload, timeout=25,
+        )
+        if not resposta.ok:
+            # Não mostrar resposta integral, pois pode conter dados do cliente.
+            raise ValueError(f"O Asaas Sandbox não aceitou a operação (HTTP {resposta.status_code}).")
+        return resposta.json()
+    except requests.RequestException as exc:
+        raise ValueError("Falha de comunicação com o Asaas Sandbox. Tente novamente.") from exc
+
+
+def localizar_cliente_asaas(email):
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT asaas_customer_id FROM public.asaas_clientes WHERE email=%s", (email,))
+            registro = cur.fetchone()
+            return registro[0] if registro else None
+
+
+def obter_ou_criar_cliente_asaas(email, nome, cpf_cnpj):
+    existente = localizar_cliente_asaas(email)
+    if existente:
+        return existente
+    cliente = asaas_sandbox_requisicao("POST", "customers", {
+        "name": nome, "email": email, "cpfCnpj": cpf_cnpj,
+        "externalReference": email,
+    })
+    identificador = cliente.get("id")
+    if not identificador:
+        raise ValueError("Asaas não retornou o identificador do cliente.")
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO public.asaas_clientes (email, asaas_customer_id)
+                           VALUES (%s,%s) ON CONFLICT (email) DO NOTHING""", (email, identificador))
+            cur.execute("SELECT asaas_customer_id FROM public.asaas_clientes WHERE email=%s", (email,))
+            return cur.fetchone()[0]
+
+
+def cobranca_pendente_asaas(email, plano, modalidade, forma):
+    # Evita gerar várias cobranças ao repetir o clique na mesma opção.
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT asaas_payment_id FROM public.asaas_cobrancas
+                WHERE email=%s AND plano=%s AND modalidade=%s AND status_asaas IN ('PENDING','AWAITING_RISK_ANALYSIS')
+                AND vencimento>=CURRENT_DATE ORDER BY criado_em DESC LIMIT 1""",
+                (email, plano, modalidade))
+            row = cur.fetchone()
+    if not row:
+        return None
+    pagamento = asaas_sandbox_requisicao("GET", f"payments/{row[0]}")
+    if pagamento.get("billingType") == forma and pagamento.get("status") in ("PENDING", "AWAITING_RISK_ANALYSIS"):
+        return pagamento
+    return None
+
+
+def criar_cobranca_asaas(email, nome, cpf_cnpj, plano, modalidade, forma):
+    if plano not in PRECOS_ASAAS or modalidade not in ("mensal", "anual"):
+        raise ValueError("Plano ou período inválido.")
+    if forma not in ("PIX", "CREDIT_CARD"):
+        raise ValueError("Forma de pagamento inválida.")
+    nome = nome.strip()
+    documento = re.sub(r"\D", "", cpf_cnpj)
+    if len(nome) < 3 or len(documento) not in (11, 14):
+        raise ValueError("Informe seu nome completo e CPF/CNPJ válido em formato.")
+    pendente = cobranca_pendente_asaas(email, plano, modalidade, forma)
+    if pendente:
+        link = pendente.get("invoiceUrl")
+        if link and link.startswith("https://"):
+            return link, pendente["id"], True
+    cliente_id = obter_ou_criar_cliente_asaas(email, nome, documento)
+    valor = PRECOS_ASAAS[plano][modalidade]
+    vencimento = date.today() + timedelta(days=3)
+    referencia = f"viralradar:{email}:{plano}:{modalidade}"
+    pagamento = asaas_sandbox_requisicao("POST", "payments", {
+        "customer": cliente_id, "billingType": forma, "value": float(valor),
+        "dueDate": vencimento.isoformat(),
+        "description": f"ViralRadar - plano {plano} - {modalidade}",
+        "externalReference": referencia,
+    })
+    payment_id, link = pagamento.get("id"), pagamento.get("invoiceUrl")
+    if not payment_id:
+        raise ValueError("Asaas não retornou o identificador da cobrança.")
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO public.asaas_cobrancas
+                (asaas_payment_id,email,asaas_customer_id,plano,modalidade,valor_centavos,status_asaas,vencimento)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (asaas_payment_id) DO NOTHING""",
+                (payment_id,email,cliente_id,plano,modalidade,int(valor*100),
+                 pagamento.get("status", "PENDING"),vencimento))
+    if not link or not link.startswith("https://"):
+        raise ValueError("Cobrança registrada, mas Asaas não retornou um link de pagamento seguro.")
+    return link, payment_id, False
 
 
 def criar_hash_senha(senha):
@@ -1060,7 +1177,7 @@ elif opcao == "Configurar Telegram":
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    st.caption("Pagamento ainda não integrado. Os preços abaixo são informativos.")
+    st.caption("Cobranças de teste disponíveis no Asaas Sandbox. Ativação automática ainda não habilitada.")
     cols = st.columns(3)
     for coluna, (codigo, plano) in zip(cols, PLANOS_VIRALRADAR.items()):
         with coluna:
@@ -1070,16 +1187,42 @@ elif opcao == "Assinatura / Planos":
             st.write(f"{plano['canais']} canais • {plano['trocas']} trocas mensais • Telegram")
             if st.button(f"Selecionar {plano['nome']}", key=f"plano_{codigo}"):
                 st.session_state.plano_checkout = codigo
-                st.info("Plano selecionado. O pagamento estará disponível após a integração com o Asaas.")
+                st.session_state.pop("asaas_checkout_link", None)
+                st.info("Plano selecionado. Abra a seção Finalizar Compra / Pagamento para testar no Asaas Sandbox.")
 
 elif opcao == "Finalizar Compra / Pagamento":
     st.subheader("🛒 Finalizar Assinatura — Checkout Seguro")
+    st.info("🧪 Ambiente de testes Asaas Sandbox. Não use cartão ou dinheiro real.")
     if st.session_state.plano_checkout:
-        st.markdown(f"📦 **Cliente Logado:** `{st.session_state.usuario_atual}`")
-        st.info(f"**Plano Escolhido:** {st.session_state.plano_checkout}")
-        st.warning("Pagamento ainda não disponível. A integração segura com o Asaas está em desenvolvimento.")
+        plano_escolhido = st.session_state.plano_checkout
+        st.markdown(f"📦 **Cliente:** `{email_usuario}`")
+        st.write(f"**Plano:** {PLANOS_VIRALRADAR[plano_escolhido]['nome']}")
+        with st.form("asaas_checkout_sandbox_v1"):
+            modalidade_compra = st.radio("Período", ["mensal", "anual"], horizontal=True,
+                                        format_func=lambda x: "Mensal" if x == "mensal" else "Anual (12 meses)")
+            st.write(f"**Valor da assinatura:** R$ {PRECOS_ASAAS[plano_escolhido][modalidade_compra]:.2f}".replace(".", ","))
+            forma_compra = st.radio("Pagamento", ["PIX", "CREDIT_CARD"], horizontal=True,
+                                  format_func=lambda x: "Pix" if x == "PIX" else "Cartão de crédito")
+            nome_pagador = st.text_input("Nome completo do responsável pelo pagamento")
+            documento_pagador = st.text_input("CPF ou CNPJ do responsável")
+            st.caption("O pagamento ocorre no ambiente seguro do Asaas. Taxas e parcelamento, quando disponíveis, são exibidos lá.")
+            confirmar_compra = st.form_submit_button("Gerar cobrança de TESTE no Asaas")
+        if confirmar_compra:
+            try:
+                with st.spinner("Criando cobrança de teste..."):
+                    link, pagamento_id, reutilizada = criar_cobranca_asaas(
+                        email_usuario, nome_pagador, documento_pagador,
+                        plano_escolhido, modalidade_compra, forma_compra)
+                st.session_state["asaas_checkout_link"] = link
+                st.session_state["asaas_checkout_payment_id"] = pagamento_id
+                st.success("Cobrança de teste localizada." if reutilizada else "Cobrança de teste criada e registrada no Supabase!")
+            except (ValueError, psycopg2.Error) as exc:
+                st.error(str(exc) if isinstance(exc, ValueError) else "Erro ao registrar cobrança no Supabase. Não tente novamente antes de conferir a tabela.")
+        if st.session_state.get("asaas_checkout_link"):
+            st.link_button("🔒 Abrir pagamento de TESTE no Asaas", st.session_state["asaas_checkout_link"])
+            st.caption("O pagamento ainda NÃO ativa o plano automaticamente. Essa será nossa próxima etapa, após validar o vínculo da cobrança.")
     else:
-        st.warning("⚠️ Nenhum plano selecionado ainda! Visite a aba 'Assinatura / Planos' primeiro.")
+        st.warning("⚠️ Nenhum plano selecionado. Visite 'Assinatura / Planos' primeiro.")
 
 elif opcao == "🛡️ Administração":
     # Verificação de autorização no servidor, independente da visibilidade do menu.
