@@ -156,6 +156,30 @@ def preparar_cortesia_para_contratacao(email):
                 raise ValueError("A conta mudou durante a operação. Tente novamente.")
 
 
+def verificar_conta_vencida_para_contratacao(email):
+    """Verifica elegibilidade sem reativar, renovar ou alterar uma assinatura.
+
+    Uma assinatura paga com vencimento passado já está bloqueada pela regra
+    de acesso e pode iniciar um NOVO checkout. O webhook deve validar o
+    pagamento real antes de prorrogar o vencimento.
+    """
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT modalidade, status, vencimento_em
+                FROM public.assinaturas WHERE email=%s""", (email,))
+            registro = cur.fetchone()
+    if not registro:
+        raise ValueError("Esta conta não possui assinatura registrada. Pode contratar um plano pelo checkout.")
+    modalidade_atual, status_atual, vencimento = registro
+    if modalidade_atual == "cortesia":
+        raise ValueError("Esta conta ainda é cortesia. Para convertê-la, use a ação específica de cortesia cancelada.")
+    if status_atual in ("cancelada", "suspensa"):
+        raise ValueError("A conta está cancelada ou suspensa. É necessária revisão administrativa antes de cobrar.")
+    if status_atual != "ativa" or not vencimento or vencimento > datetime.now(timezone.utc):
+        raise ValueError("Esta assinatura não está vencida e elegível para esta operação.")
+    return "Assinatura vencida confirmada. A conta permanece SEM acesso; faça login nela e gere uma NOVA cobrança no Asaas Sandbox."
+
+
 def atualizar_assinatura_admin(email, plano, modalidade, status, dias):
     limites = PLANOS_VIRALRADAR[plano]
     with conectar_banco() as conn:
@@ -1051,7 +1075,10 @@ with st.sidebar:
 
 # Uma conta sem assinatura pode ver os planos, mas não operar o monitoramento.
 if not acesso_ativo and opcao not in ("Assinatura / Planos", "Finalizar Compra / Pagamento", "Suporte", "🛡️ Administração"):
-    st.warning("Sua conta não possui assinatura ativa. Escolha um plano ou entre em contato com o suporte.")
+    if assinatura and assinatura.get("status") == "ativa" and assinatura.get("vencimento_em") and assinatura["vencimento_em"] <= datetime.now(timezone.utc):
+        st.warning("Sua assinatura está vencida. Escolha um plano e gere uma nova cobrança para renovar o acesso.")
+    else:
+        st.warning("Sua conta não possui assinatura ativa. Escolha um plano ou entre em contato com o suporte.")
     st.stop()
 
 perfis_cadastrados = ler_perfis_db(email_usuario)
@@ -1233,6 +1260,13 @@ elif opcao == "Configurar Telegram":
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
+    if assinatura:
+        situacao_exibida = ("vencida (sem acesso)" if assinatura.get("status") == "ativa"
+            and assinatura.get("vencimento_em") and assinatura["vencimento_em"] <= datetime.now(timezone.utc)
+            else assinatura.get("status", "não informada"))
+        st.info(f"Sua assinatura: {PLANOS_VIRALRADAR.get(assinatura['plano'], {}).get('nome', assinatura['plano'])} | "
+                f"Modalidade: {assinatura['modalidade']} | Situação: {situacao_exibida} | "
+                f"Vencimento: {exibir_horario_br(assinatura['vencimento_em'])}")
     st.caption("Cobranças de teste no Asaas Sandbox. A ativação depende da confirmação verificada pelo webhook e da elegibilidade da conta.")
     cols = st.columns(3)
     for coluna, (codigo, plano) in zip(cols, PLANOS_VIRALRADAR.items()):
@@ -1341,6 +1375,8 @@ elif opcao == "🛡️ Administração":
         st.rerun()
     st.divider()
     st.subheader("Gerenciar autorização")
+    if st.session_state.get("admin_resultado_autorizacao"):
+        st.success(st.session_state.pop("admin_resultado_autorizacao"))
     if not clientes:
         st.info("Nenhuma conta corresponde aos filtros. Ajuste a pesquisa para selecionar um cliente.")
     else:
@@ -1350,11 +1386,13 @@ elif opcao == "🛡️ Administração":
                 format_func=lambda x: PLANOS_VIRALRADAR[x]["nome"])
             modalidade = st.selectbox("Modalidade", ["cortesia", "mensal", "anual"])
             operacao = st.radio("Ação", ["Liberar por prazo", "Suspender", "Cancelar",
-                "Preparar cortesia cancelada para contratação"], horizontal=False)
+                "Preparar cortesia cancelada para contratação",
+                "Verificar assinatura vencida para nova contratação"], horizontal=False)
             dias = st.number_input("Dias de acesso (somente para liberação manual)",
                 min_value=1, max_value=366, value=30)
-            st.caption("Preparar para contratação NÃO libera acesso: deixa a conta vencida e apta a uma NOVA cobrança. "
-                "Disponível apenas para cortesia cancelada sem pagamentos aplicados.")
+            st.caption("Preparar cortesia cancelada altera somente a modalidade e deixa o prazo vencido, SEM liberar acesso. "
+                "Verificar assinatura vencida apenas confere a elegibilidade, SEM alterar o banco. "
+                "Contas suspensas ou canceladas exigem revisão administrativa.")
             confirmar = st.checkbox("Confirmo que desejo alterar esta conta")
             enviar = st.form_submit_button("Aplicar alteração")
         if enviar and not confirmar:
@@ -1363,12 +1401,14 @@ elif opcao == "🛡️ Administração":
             try:
                 if operacao == "Preparar cortesia cancelada para contratação":
                     preparar_cortesia_para_contratacao(alvo)
-                    st.success("Conta preparada SEM acesso. Faça login nessa conta e gere uma NOVA cobrança no Asaas Sandbox.")
+                    st.session_state["admin_resultado_autorizacao"] = "Conta preparada SEM acesso. Faça login nessa conta e gere uma NOVA cobrança no Asaas Sandbox."
+                elif operacao == "Verificar assinatura vencida para nova contratação":
+                    st.session_state["admin_resultado_autorizacao"] = verificar_conta_vencida_para_contratacao(alvo)
                 else:
                     novo_status = {"Liberar por prazo": "ativa", "Suspender": "suspensa",
                         "Cancelar": "cancelada"}[operacao]
                     atualizar_assinatura_admin(alvo, plano, modalidade, novo_status, int(dias))
-                    st.success("Autorização atualizada no Supabase.")
+                    st.session_state["admin_resultado_autorizacao"] = "Autorização atualizada no Supabase."
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
