@@ -88,16 +88,45 @@ def assinatura_valida(assinatura):
     return bool(inicio and fim and inicio <= agora < fim)
 
 
-def listar_clientes_admin():
+def listar_clientes_admin(busca="", filtro_status="Todos", filtro_plano="Todos", filtro_modalidade="Todas", pagina=1, por_pagina=25):
+    """Pesquisa paginada no PostgreSQL; não carrega a base inteira na interface."""
+    condicoes = []
+    parametros = []
+    if busca.strip():
+        condicoes.append("u.email ILIKE %s")
+        parametros.append("%" + busca.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    if filtro_status != "Todos":
+        condicoes.append("COALESCE(a.status, 'sem assinatura') = %s")
+        parametros.append(filtro_status)
+    if filtro_plano != "Todos":
+        condicoes.append("COALESCE(a.plano, 'sem plano') = %s")
+        parametros.append(filtro_plano)
+    if filtro_modalidade != "Todas":
+        condicoes.append("COALESCE(a.modalidade, '-') = %s")
+        parametros.append(filtro_modalidade)
+    where = " WHERE " + " AND ".join(condicoes) if condicoes else ""
+    origem = " FROM public.usuarios u LEFT JOIN public.assinaturas a ON a.email=u.email"
     with conectar_banco() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*)" + origem + where, tuple(parametros))
+            total = cur.fetchone()[0]
+            paginas = max(1, (total + por_pagina - 1) // por_pagina)
+            pagina = min(max(1, pagina), paginas)
             cur.execute("""SELECT u.email, COALESCE(a.plano, 'sem plano'),
                                   COALESCE(a.modalidade, '-'), COALESCE(a.status, 'sem assinatura'),
-                                  a.vencimento_em, a.limite_canais, a.limite_trocas
-                           FROM public.usuarios u
-                           LEFT JOIN public.assinaturas a ON a.email=u.email
-                           ORDER BY u.email""")
-            return cur.fetchall()
+                                  a.vencimento_em, a.limite_canais, a.limite_trocas"""
+                        + origem + where + " ORDER BY u.email LIMIT %s OFFSET %s",
+                        tuple(parametros + [por_pagina, (pagina - 1) * por_pagina]))
+            return cur.fetchall(), total, pagina, paginas
+
+
+def localizar_conta_admin(email):
+    """Consulta exata para operações administrativas, sem depender da página atual."""
+    with conectar_banco() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT email FROM public.usuarios WHERE LOWER(email)=LOWER(%s)", (email.strip(),))
+            registro = cur.fetchone()
+            return registro[0] if registro else None
 
 
 def atualizar_assinatura_admin(email, plano, modalidade, status, dias):
@@ -152,8 +181,7 @@ def testar_conexao_asaas_sandbox():
 
 
 
-# Cobranças de homologação: o webhook registra eventos, mas NÃO ativa assinaturas
-# até que o processador de eventos seja implementado e testado separadamente.
+# Cobranças de homologação: a ativação depende do webhook e das regras do processador no Supabase.
 PRECOS_ASAAS = {
     "inicial": {"mensal": Decimal("19.99"), "anual": Decimal("179.88")},
     "criador": {"mensal": Decimal("29.99"), "anual": Decimal("299.88")},
@@ -1177,7 +1205,7 @@ elif opcao == "Configurar Telegram":
 
 elif opcao == "Assinatura / Planos":
     st.subheader("💎 Planos e Assinaturas (ViralRadar)")
-    st.caption("Cobranças de teste disponíveis no Asaas Sandbox. Ativação automática ainda não habilitada.")
+    st.caption("Cobranças de teste disponíveis no Asaas Sandbox. A ativação depende da confirmação do webhook e das regras da assinatura.")
     cols = st.columns(3)
     for coluna, (codigo, plano) in zip(cols, PLANOS_VIRALRADAR.items()):
         with coluna:
@@ -1222,7 +1250,7 @@ elif opcao == "Finalizar Compra / Pagamento":
                 st.error(str(exc) if isinstance(exc, ValueError) else "Erro ao registrar cobrança no Supabase. Não tente novamente antes de conferir a tabela.")
         if st.session_state.get("asaas_checkout_link"):
             st.link_button("🔒 Abrir pagamento de TESTE no Asaas", st.session_state["asaas_checkout_link"])
-            st.caption("O pagamento ainda NÃO ativa o plano automaticamente. Essa será nossa próxima etapa, após validar o vínculo da cobrança.")
+            st.caption("A confirmação do pagamento será processada pelo webhook, conforme as regras de elegibilidade da assinatura.")
     else:
         st.warning("⚠️ Nenhum plano selecionado. Visite 'Assinatura / Planos' primeiro.")
 
@@ -1232,7 +1260,7 @@ elif opcao == "🛡️ Administração":
         st.error("Acesso não autorizado.")
         st.stop()
     st.subheader("🛡️ Central Administrativa — ViralRadar")
-    st.caption("Gerenciamento manual de testes. Pagamentos Asaas ainda não integrados.")
+    st.caption("Administração de contas e testes de integração com Asaas Sandbox.")
     with st.expander("🔌 Integração Asaas — testar conexão Sandbox", expanded=True):
         st.caption("Teste seguro de leitura. Não cria clientes, cobranças ou assinaturas e não exibe a chave.")
         if st.button("🧪 Testar conexão Asaas Sandbox", key="asaas_sandbox_teste_v1"):
@@ -1243,17 +1271,45 @@ elif opcao == "🛡️ Administração":
             else:
                 st.error(mensagem_asaas)
     st.divider()
-    clientes = listar_clientes_admin()
-    st.metric("Clientes cadastrados", len(clientes))
-    st.dataframe([{
-        "E-mail": e, "Plano": p, "Modalidade": m, "Status": status,
-        "Vencimento": exibir_horario_br(venc) if venc else "—",
-        "Canais": lc, "Trocas": lt
-    } for e, p, m, status, venc, lc, lt in clientes], use_container_width=True, hide_index=True)
+    st.subheader("🔎 Gerenciar assinaturas")
+    st.caption("Pesquise diretamente no Supabase. A consulta é paginada para funcionar também com muitos assinantes.")
+    busca = st.text_input("Buscar por e-mail", placeholder="Digite o e-mail completo ou parte dele", key="admin_busca_email_v2")
+    col_status, col_plano, col_modalidade = st.columns(3)
+    with col_status:
+        filtro_status = st.selectbox("Situação", ["Todos", "ativa", "cancelada", "suspensa", "vencida", "pendente", "sem assinatura"], key="admin_filtro_status_v2")
+    with col_plano:
+        filtro_plano = st.selectbox("Plano", ["Todos", "inicial", "criador", "agencia", "sem plano"], key="admin_filtro_plano_v2")
+    with col_modalidade:
+        filtro_modalidade = st.selectbox("Modalidade", ["Todas", "cortesia", "mensal", "anual", "-"], key="admin_filtro_modalidade_v2")
+    pagina_solicitada = st.number_input("Página", min_value=1, step=1, value=1, key="admin_pagina_v2")
+    try:
+        clientes, total, pagina_atual, paginas = listar_clientes_admin(
+            busca, filtro_status, filtro_plano, filtro_modalidade, int(pagina_solicitada))
+    except psycopg2.Error:
+        st.error("Não foi possível consultar as assinaturas. Confira a conexão com o Supabase.")
+        st.stop()
+    st.metric("Contas encontradas", total)
+    st.caption(f"Página {pagina_atual} de {paginas} • Até 25 contas por página")
+    if clientes:
+        st.dataframe([{
+            "E-mail": e, "Plano": p, "Modalidade": m, "Status": status,
+            "Vencimento (Brasília)": exibir_horario_br(venc) if venc else "—",
+            "Canais": lc, "Trocas": lt
+        } for e, p, m, status, venc, lc, lt in clientes],
+            use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhuma conta corresponde aos filtros selecionados.")
+
     st.divider()
-    st.subheader("Gerenciar autorização")
+    st.subheader("🛡️ Gerenciar autorização")
+    st.caption("Selecione uma conta encontrada ou informe seu e-mail completo para localizá-la diretamente.")
+    contas_encontradas = [r[0] for r in clientes]
+    escolha = st.selectbox("Conta encontrada", ["Digitar e-mail manualmente"] + contas_encontradas,
+                           key="admin_conta_selecionada_v2")
+    email_manual = st.text_input("E-mail exato para administrar", value=busca.strip() if "@" in busca and " " not in busca else "",
+                                 key="admin_email_manual_v2") if escolha == "Digitar e-mail manualmente" else ""
+    alvo = email_manual.strip().lower() if escolha == "Digitar e-mail manualmente" else escolha
     with st.form("admin_assinatura_form"):
-        alvo = st.selectbox("Conta", [r[0] for r in clientes])
         plano = st.selectbox("Plano", list(PLANOS_VIRALRADAR),
                              format_func=lambda x: PLANOS_VIRALRADAR[x]["nome"])
         modalidade = st.selectbox("Modalidade", ["cortesia", "mensal", "anual"])
@@ -1264,13 +1320,21 @@ elif opcao == "🛡️ Administração":
     if enviar and not confirmar:
         st.warning("Marque a caixa de confirmação antes de aplicar a alteração.")
     elif enviar:
-        try:
-            novo_status = {"Liberar por prazo": "ativa", "Suspender": "suspensa", "Cancelar": "cancelada"}[operacao]
-            atualizar_assinatura_admin(alvo, plano, modalidade, novo_status, int(dias))
-            st.success("Autorização atualizada no Supabase.")
-            st.rerun()
-        except (ValueError, psycopg2.Error) as exc:
-            st.error(f"Não foi possível atualizar: {type(exc).__name__}")
+        if not alvo:
+            st.warning("Selecione uma conta ou informe o e-mail completo.")
+        else:
+            try:
+                conta_confirmada = localizar_conta_admin(alvo)
+                if not conta_confirmada:
+                    st.error("E-mail não encontrado entre os usuários cadastrados.")
+                else:
+                    novo_status = {"Liberar por prazo": "ativa", "Suspender": "suspensa", "Cancelar": "cancelada"}[operacao]
+                    atualizar_assinatura_admin(conta_confirmada, plano, modalidade, novo_status, int(dias))
+                    st.success("Autorização atualizada no Supabase.")
+                    st.rerun()
+            except (ValueError, psycopg2.Error):
+                st.error("Não foi possível atualizar a autorização. Nenhuma confirmação de alteração foi emitida.")
+    st.info("A preparação de uma cortesia para pagamento automático será adicionada após validarmos as regras do processador de pagamentos, para evitar liberações indevidas.")
 
 elif opcao == "Suporte":
     st.subheader("💬 Central de Ajuda")
